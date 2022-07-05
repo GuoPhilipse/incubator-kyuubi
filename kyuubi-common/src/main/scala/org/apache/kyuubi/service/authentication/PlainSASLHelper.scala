@@ -40,11 +40,14 @@ object PlainSASLHelper {
       new TSetIpAddressProcessor[Iface](service)
   }
 
-  private class PlainServerCallbackHandler private(authMethod: AuthMethod, conf: KyuubiConf)
+  private class PlainServerCallbackHandler private (
+      authMethod: AuthMethod,
+      conf: KyuubiConf,
+      isServer: Boolean)
     extends CallbackHandler {
 
-    def this(authMethodStr: String, conf: KyuubiConf) =
-      this(AuthMethods.withName(authMethodStr), conf)
+    def this(authMethodStr: String, conf: KyuubiConf, isServer: Boolean) =
+      this(AuthMethods.withName(authMethodStr), conf, isServer)
 
     @throws[UnsupportedCallbackException]
     override def handle(callbacks: Array[Callback]): Unit = {
@@ -61,7 +64,8 @@ object PlainSASLHelper {
           case _ => throw new UnsupportedCallbackException(callback)
         }
       }
-      val provider = AuthenticationProviderFactory.getAuthenticationProvider(authMethod, conf)
+      val provider =
+        AuthenticationProviderFactory.getAuthenticationProvider(authMethod, conf, isServer)
       provider.authenticate(username, password)
       if (ac != null) ac.setAuthorized(true)
     }
@@ -71,16 +75,21 @@ object PlainSASLHelper {
     SQLPlainProcessorFactory(service)
   }
 
-  def getTransportFactory(authTypeStr: String, conf: KyuubiConf): TTransportFactory = {
-    val saslFactory = new TSaslServerTransport.Factory()
+  def getTransportFactory(
+      authTypeStr: String,
+      conf: KyuubiConf,
+      transportFactory: Option[TSaslServerTransport.Factory] = None,
+      isServer: Boolean = true): TTransportFactory = {
+    val saslFactory = transportFactory.getOrElse(new TSaslServerTransport.Factory())
     try {
-      val handler = new PlainServerCallbackHandler(authTypeStr, conf)
+      val handler = new PlainServerCallbackHandler(authTypeStr, conf, isServer)
       val props = new java.util.HashMap[String, String]
       saslFactory.addServerDefinition("PLAIN", authTypeStr, null, props, handler)
     } catch {
       case e: NoSuchElementException =>
         throw new IllegalArgumentException(
-          s"Illegal authentication type $authTypeStr for plain transport", e)
+          s"Illegal authentication type $authTypeStr for plain transport",
+          e)
     }
     saslFactory
   }
@@ -105,8 +114,8 @@ object PlainSASLHelper {
       null,
       null,
       null,
-      Collections.emptyMap[String, String]()
-      , callBackHandler,
+      Collections.emptyMap[String, String](),
+      callBackHandler,
       underlyingTransport)
   }
 }

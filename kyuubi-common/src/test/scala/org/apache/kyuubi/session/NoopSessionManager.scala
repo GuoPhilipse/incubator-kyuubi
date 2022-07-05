@@ -20,33 +20,21 @@ package org.apache.kyuubi.session
 import org.apache.hive.service.rpc.thrift.TProtocolVersion
 
 import org.apache.kyuubi.KyuubiSQLException
-import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.operation.{NoopOperationManager, OperationManager}
 
 class NoopSessionManager extends SessionManager("noop") {
   override val operationManager: OperationManager = new NoopOperationManager()
 
-  def setOperationLogRootDir(logRoot: String): Unit = {
-    _operationLogRoot = Some(logRoot)
-  }
-
-  override def initialize(conf: KyuubiConf): Unit = {
-    _operationLogRoot = _operationLogRoot.orElse(Some("target/operation_logs"))
-    super.initialize(conf)
-  }
-
-  override def openSession(
+  override protected def createSession(
       protocol: TProtocolVersion,
       user: String,
       password: String,
       ipAddress: String,
-      conf: Map[String, String]): SessionHandle = {
+      conf: Map[String, String]): Session = {
     if (conf.get("kyuubi.test.should.fail").exists(_.toBoolean)) {
       throw KyuubiSQLException("Asked to fail")
     }
-    val session = new NoopSessionImpl(protocol, user, password, ipAddress, conf, this)
-    setSession(session.handle, session)
-    session.handle
+    new NoopSessionImpl(protocol, user, password, ipAddress, conf, this)
   }
 
   override protected def isServer: Boolean = true

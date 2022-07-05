@@ -19,16 +19,15 @@ package org.apache.kyuubi.engine.spark.events
 
 import java.util.Date
 
-import org.apache.spark.sql.Encoders
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.scheduler.SparkListenerEvent
 
 import org.apache.kyuubi.Utils
 import org.apache.kyuubi.config.KyuubiConf._
 import org.apache.kyuubi.engine.spark.SparkSQLEngine
+import org.apache.kyuubi.events.KyuubiEvent
 import org.apache.kyuubi.service.ServiceState
 
 /**
- *
  * @param applicationId application id a.k.a, the unique id for engine
  * @param applicationName the application name
  * @param owner the application user
@@ -57,9 +56,8 @@ case class EngineEvent(
     endTime: Long,
     state: Int,
     diagnostic: String,
-    settings: Map[String, String]) extends KyuubiSparkEvent {
+    settings: Map[String, String]) extends KyuubiEvent with SparkListenerEvent {
 
-  override def schema: StructType = Encoders.product[EngineEvent].schema
   override lazy val partitions: Seq[(String, String)] =
     ("day", Utils.getDateFromTimestamp(startTime)) :: Nil
 
@@ -70,14 +68,19 @@ case class EngineEvent(
     val executorCore = settings.getOrElse("spark.executor.cores", 2)
     val executorMemory = settings.getOrElse("spark.executor.memory", "1g")
     val dae = settings.getOrElse("spark.dynamicAllocation.enabled", "false").toBoolean
-    val maxExecutors = if (dae) {
-      settings.getOrElse("spark.dynamicAllocation.maxExecutors", Int.MaxValue)
-    } else {
-      settings.getOrElse("spark.executor.instances", 2)
-    }
+    val maxExecutors =
+      if (dae) {
+        settings.getOrElse("spark.dynamicAllocation.maxExecutors", Int.MaxValue)
+      } else {
+        settings.getOrElse("spark.executor.instances", 2)
+      }
+    val tags = settings.getOrElse(
+      "spark.yarn.tags",
+      settings.getOrElse("spark.kubernetes.driver.label.kyuubi_unique_tag", ""))
     s"""
        |    Spark application name: $applicationName
        |          application ID:  $applicationId
+       |          application tags: $tags
        |          application web UI: $webUrl
        |          master: $master
        |          version: $sparkVersion
@@ -98,11 +101,12 @@ object EngineEvent {
     val webUrl = sc.getConf.getOption(
       "spark.org.apache.hadoop.yarn.server.webproxy.amfilter.AmIpFilter.param.PROXY_URI_BASES")
       .orElse(sc.uiWebUrl).getOrElse("")
-    val connectionUrl = if (engine.getServiceState.equals(ServiceState.LATENT)) {
-      null
-    } else {
-      engine.frontendServices.head.connectionUrl
-    }
+    val connectionUrl =
+      if (engine.getServiceState.equals(ServiceState.LATENT)) {
+        null
+      } else {
+        engine.frontendServices.head.connectionUrl
+      }
     new EngineEvent(
       sc.applicationId,
       sc.applicationAttemptId,
@@ -115,7 +119,7 @@ object EngineEvent {
       webUrl,
       sc.startTime,
       endTime = -1L,
-      state = 0,
+      state = engine.getServiceState.id,
       diagnostic = "",
       sc.getConf.getAll.toMap ++ engine.getConf.getAll)
   }

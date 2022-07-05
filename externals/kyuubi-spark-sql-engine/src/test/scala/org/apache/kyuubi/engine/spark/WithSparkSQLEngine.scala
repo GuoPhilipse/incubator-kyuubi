@@ -28,7 +28,7 @@ trait WithSparkSQLEngine extends KyuubiFunSuite {
   protected var engine: SparkSQLEngine = _
   // conf will be loaded until start spark engine
   def withKyuubiConf: Map[String, String]
-  val kyuubiConf: KyuubiConf = SparkSQLEngine.kyuubiConf
+  def kyuubiConf: KyuubiConf = SparkSQLEngine.kyuubiConf
 
   protected var connectionUrl: String = _
 
@@ -36,7 +36,7 @@ trait WithSparkSQLEngine extends KyuubiFunSuite {
   //    engine.initialize.sql='SHOW DATABASES'
   protected var initJobId: Int = {
     sparkMajorMinorVersion match {
-      case (3, 2) => 1 // SPARK-35378
+      case (3, minor) if minor >= 2 => 1 // SPARK-35378
       case (3, _) => 0
       case _ =>
         throw new IllegalArgumentException(s"Not Support spark version $sparkMajorMinorVersion")
@@ -53,18 +53,21 @@ trait WithSparkSQLEngine extends KyuubiFunSuite {
     val metastorePath = Utils.createTempDir()
     warehousePath.toFile.delete()
     metastorePath.toFile.delete()
-    System.setProperty("javax.jdo.option.ConnectionURL",
+    System.setProperty(
+      "javax.jdo.option.ConnectionURL",
       s"jdbc:derby:;databaseName=$metastorePath;create=true")
     System.setProperty("spark.sql.warehouse.dir", warehousePath.toString)
     System.setProperty("spark.sql.hive.metastore.sharedPrefixes", "org.apache.hive.jdbc")
     System.setProperty("spark.ui.enabled", "false")
     withKyuubiConf.foreach { case (k, v) =>
       System.setProperty(k, v)
-      kyuubiConf.set(k, v)
     }
 
+    SparkSession.getActiveSession.foreach(_.close())
+    SparkSession.getDefaultSession.foreach(_.close())
     SparkSession.clearActiveSession()
     SparkSession.clearDefaultSession()
+    SparkSQLEngine.setupConf()
     spark = SparkSQLEngine.createSpark()
     SparkSQLEngine.startEngine(spark)
     engine = SparkSQLEngine.currentEngine.get
@@ -80,7 +83,6 @@ trait WithSparkSQLEngine extends KyuubiFunSuite {
     // we need to clean up conf since it's the global config in same jvm.
     withKyuubiConf.foreach { case (k, _) =>
       System.clearProperty(k)
-      kyuubiConf.unset(k)
     }
 
     if (engine != null) {

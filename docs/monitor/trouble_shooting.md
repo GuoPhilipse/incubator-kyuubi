@@ -15,11 +15,6 @@
  - limitations under the License.
  -->
 
-<div align=center>
-
-![](../imgs/kyuubi_logo.png)
-
-</div>
 
 # Trouble Shooting
 
@@ -200,7 +195,7 @@ Caused by: org.apache.thrift.TApplicationException: Invalid method name: 'get_ta
 
 This error means that you are using incompatible version of Hive metastore client to connect the Hive metastore server.
 
-To fix this problem you could use a compatible version for Hive client by configuring
+To fix this problem you could use a compatible version of Hive client by configuring
 `spark.sql.hive.metastore.jars` and `spark.sql.hive.metastore.version` at Spark side.
 
 

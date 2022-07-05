@@ -62,12 +62,13 @@ class ConfigEntrySuite extends KyuubiFunSuite {
   }
 
   test("config entry with default") {
-    val e1 = new ConfigEntryWithDefault[Long]("kyuubi.long.spark",
+    val e1 = new ConfigEntryWithDefault[Long](
+      "kyuubi.long.spark",
       2,
       s => s.toLong + 1,
       v => (v - 1).toString,
-    "doc",
-    "0.11.1",
+      "doc",
+      "0.11.1",
       "long",
       false)
 
@@ -119,7 +120,7 @@ class ConfigEntrySuite extends KyuubiFunSuite {
   }
 
   test("fallback config entry") {
-    val origin = KyuubiConf.buildConf("origin.spark")
+    val origin = KyuubiConf.buildConf("kyuubi.origin.spark")
       .version("1.1.1")
       .stringConf.createWithDefault("origin")
     val fallback =

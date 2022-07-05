@@ -18,16 +18,16 @@
 package org.apache.kyuubi.util
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream}
-import java.util.{Map => JMap}
+import java.util.{Base64, Map => JMap}
 
 import scala.collection.JavaConverters._
 
-import org.apache.commons.codec.binary.Base64
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier
 import org.apache.hadoop.io.Text
 import org.apache.hadoop.security.{Credentials, SecurityUtil, UserGroupInformation}
 import org.apache.hadoop.security.token.{Token, TokenIdentifier}
+import org.apache.hadoop.yarn.conf.YarnConfiguration
 
 import org.apache.kyuubi.config.KyuubiConf
 
@@ -41,10 +41,17 @@ object KyuubiHadoopUtils {
     classOf[Credentials].getDeclaredField("tokenMap")
   tokenMapField.setAccessible(true)
 
-  def newHadoopConf(conf: KyuubiConf): Configuration = {
-    val hadoopConf = new Configuration()
-    conf.getAll.foreach { case (k, v) => hadoopConf.set(k, v) }
+  def newHadoopConf(
+      conf: KyuubiConf,
+      loadDefaults: Boolean = true): Configuration = {
+    val hadoopConf = new Configuration(loadDefaults)
+    conf.getAll
+      .foreach { case (k, v) => hadoopConf.set(k, v) }
     hadoopConf
+  }
+
+  def newYarnConfiguration(conf: KyuubiConf): YarnConfiguration = {
+    new YarnConfiguration(newHadoopConf(conf))
   }
 
   def getServerPrincipal(principal: String): String = {
@@ -55,13 +62,11 @@ object KyuubiHadoopUtils {
     val byteStream = new ByteArrayOutputStream
     creds.writeTokenStorageToStream(new DataOutputStream(byteStream))
 
-    val encoder = new Base64(0, null, false)
-    encoder.encodeToString(byteStream.toByteArray)
+    Base64.getMimeEncoder.encodeToString(byteStream.toByteArray)
   }
 
   def decodeCredentials(newValue: String): Credentials = {
-    val decoder = new Base64(0, null, false)
-    val decoded = decoder.decode(newValue)
+    val decoded = Base64.getMimeDecoder.decode(newValue)
 
     val byteStream = new ByteArrayInputStream(decoded)
     val creds = new Credentials()

@@ -17,21 +17,23 @@
 
 package org.apache.kyuubi.operation.tpcds
 
+import org.scalatest.tags.Slow
+
 import org.apache.kyuubi.{DeltaSuiteMixin, WithKyuubiServer}
 import org.apache.kyuubi.config.KyuubiConf
-import org.apache.kyuubi.operation.JDBCTestUtils
-import org.apache.kyuubi.tags.{DeltaTest, ExtendedSQLTest}
+import org.apache.kyuubi.operation.HiveJDBCTestHelper
+import org.apache.kyuubi.tags.DeltaTest
 
+@Slow
 @DeltaTest
-@ExtendedSQLTest
 class DDLTPCDSSuite extends WithKyuubiServer
-  with JDBCTestUtils
+  with HiveJDBCTestHelper
   with TPCDSHelper
   with DeltaSuiteMixin {
 
   override protected val conf: KyuubiConf = {
     val kyuubiConf = KyuubiConf().set(KyuubiConf.ENGINE_IDLE_TIMEOUT, 20000L)
-     extraConfigs.foreach { case (k, v) => kyuubiConf.set(k, v) }
+    extraConfigs.foreach { case (k, v) => kyuubiConf.set(k, v) }
     kyuubiConf
   }
 

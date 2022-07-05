@@ -42,7 +42,7 @@ The release process consists of several steps:
 
 1. Decide to release
 2. Prepare for the release
-3. Cut branch iff for __major__ release
+3. Cut branch off for __major__ release
 4. Build a release candidate
 5. Vote on the release candidate
 6. If necessary, fix any issues and go back to step 3.
@@ -78,7 +78,7 @@ signing the release and access to various release repositories.
 #### ASF authentication
 
 The environments `ASF_USERNAME` and `ASF_PASSWORD` have been used in several places and several times in the release
-process, you can either one-time set up them in `~/.bashrc` or `~/.zshrc`, or export them in terminal everytime.
+process, you can either one-time set up them in `~/.bashrc` or `~/.zshrc`, or export them in terminal every time.
 
 ```shell
 export ASF_USERNAME=<your apache username>
@@ -112,6 +112,9 @@ pub   rsa4096 2021-08-30 [SC]
 uid           [ultimate] Cheng Pan <chengpan@apache.org>
 sub   rsa4096 2021-08-30 [E]
 ```
+
+> Note: To follow the [Apache's release specification](https://infra.apache.org/release-signing.html#note), all new RSA keys generated should be at least 4096 bits. Do not generate new DSA keys.
+
 Here, the key ID is the 8-digit hex string in the pub line: `29BCC75D`.
 
 To export the PGP public key, using:
@@ -119,7 +122,7 @@ To export the PGP public key, using:
 gpg --armor --export 29BCC75D
 ```
 
-If you have more than one gpg key, you can specify the default key as following:
+If you have more than one gpg key, you can specify the default key as the following:
 ```
 echo 'default-key <key-fpr>' > ~/.gnupg/gpg.conf
 ```
@@ -128,12 +131,21 @@ The last step is to update the KEYS file with your code signing key
 https://www.apache.org/dev/openpgp.html#export-public-key
 
 ```shell
-svn checkout --depth=files "https://dist.apache.org/repos/dist/dev/incubator/kyuubi" work/svn-kyuubi
-(gpg --list-sigs "${ASF_USERNAME}@apache.org" && gpg --export --armor "${ASF_USERNAME}@apache.org") >> KEYS
+svn checkout --depth=files "https://dist.apache.org/repos/dist/release/incubator/kyuubi" work/svn-kyuubi
+
+(gpg --list-sigs "${ASF_USERNAME}@apache.org" && gpg --export --armor "${ASF_USERNAME}@apache.org") >> work/svn-kyuubi/KEYS
+
 svn commit --username "${ASF_USERNAME}" --password "${ASF_PASSWORD}" --message "Update KEYS" work/svn-kyuubi
 ```
 
-## Cut branch iff for major release
+In order to make yourself have the right permission to stage java artifacts in Apache Nexus staging repository, please submit your GPG public key to ubuntu server via
+
+```shell
+gpg --keyserver hkp://keyserver.ubuntu.com --send-keys ${PUBLIC_KEY} # send public key to ubuntu server
+gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys ${PUBLIC_KEY} # verify
+```
+
+## Cut branch if for major release
 
 Kyuubi use version pattern `{MAJOR_VERSION}.{MINOR_VERSION}.{PATCH_VERSION}[-{OPTIONAL_SUFFIX}]`, e.g. `1.3.0-incubating`.
 __Major Release__ means `MAJOR_VERSION` or `MINOR_VERSION` changed, and __Patch Release__ means `PATCH_VERSION` changed.
@@ -141,11 +153,15 @@ __Major Release__ means `MAJOR_VERSION` or `MINOR_VERSION` changed, and __Patch 
 The main step towards preparing a major release is to create a release branch. This is done via standard Git branching
 mechanism and should be announced to the community once the branch is created.
 
+> Note: If you are releasing a patch version, you can ignore this step.
+
 The release branch pattern is `branch-{MAJOR_VERSION}.{MINOR_VERSION}`, e.g. `branch-1.3`.
 
 After cutting release branch, don't forget bump version in `master` branch.
 
 ## Build a release candidate
+
+> Don't forget to switch to the release branch!  
 
 1. Set environment variables.
 
@@ -159,7 +175,7 @@ export RELEASE_RC_NO=<RC number, e.g. 0>
 ```shell
 build/mvn versions:set -DgenerateBackupPoms=false \
   -DnewVersion="${RELEASE_VERSION}" \
-  -Pkubernetes,kyuubi-extension-spark-3-1,spark-block-cleaner,tpcds
+  -Pspark-3.2,spark-block-cleaner
 
 git commit -am "[RELEASE] Bump ${RELEASE_VERSION}"
 ```
@@ -168,12 +184,24 @@ git commit -am "[RELEASE] Bump ${RELEASE_VERSION}"
 
 The tag pattern is `v${RELEASE_VERSION}-rc${RELEASE_RC_NO}`, e.g. `v1.3.0-incubating-rc0`
 
+> NOTE: After all the voting passed, be sure to create a final tag with the pattern: `v${RELEASE_VERSION}`
+
 4. Package the release binaries & sources, and upload them to the Apache staging SVN repo. Publish jars to the Apache
 staging Maven repo.
 
 ```shell
 build/release/release.sh publish
 ```
+
+To make your release available in the staging repository, you must close the staging repo in the [Apache Nexus](https://repository.apache.org/#stagingRepositories). Until you close, you can re-run deploying to staging multiple times. But once closed, it will create a new staging repo. So ensure you close this, so that the next RC (if need be) is on a new repo. Once everything is good, close the staging repository on Apache Nexus.
+
+5. Generate a pre-release note from GitHub for the subsequent voting.
+
+Goto the [release page](https://github.com/apache/incubator-kyuubi/releases) and click the "Draft a new release" button, then it would jump to a new page to prepare the release.
+
+Filling in all the necessary information required by the form. And in the bottom of the form, choose the "This is a pre-release" checkbox. Finally, click the "Publish release" button to finish the step.
+
+> Note: the pre-release note is used for voting purposes. It would be marked with a **Pre-release** tag. After all the voting works(dev and general) are finished, do not forget to inverse the "This is a pre-release" checkbox. The pre-release version comes from vx.y.z-incubating-rcN tags, and the final version should come from vx.y.z-incubating tags.
 
 ## Vote on the release candidate
 
@@ -183,8 +211,15 @@ The release voting takes place on the Apache Kyuubi (Incubating) developers list
 - Recommend represent voting closing time in UTC format.
 - Make sure the email is in text format and the links are correct
 
+> Note: you can generate the voting mail content for dev ML automatically via invoke the `build/release/script/dev_kyuubi_vote.sh` script. 
+
 Once the vote is done, you should also send out a summary email with the totals, with a subject that looks
 something like __[VOTE][RESULT] ....__
+
+Then, you can move the release vote on the general incubator mailing list, and generate the voting mail content automatically via invoke the `build/release/script/general_incubator_vote.sh` script.
+Also, you should send out a summary email like dev ML voting.
+
+> Note, any reason causes voting cancel. You should re-vote on the dev ML firstly.
 
 ## Finalize the Release
 
@@ -217,10 +252,32 @@ After some time this will be sync’d to [Maven Central](https://search.maven.or
 
 ### Update Website
 
-TODO
+Fork and clone [Apache Kyuubi website](https://github.com/apache/incubator-kyuubi-website)
+
+1. Add a new markdown file in `src/zh/news/`, `src/en/news/`
+2. Add a new markdown file in `src/zh/release/`, `src/en/release/`
+3. Follow [Build Document](../develop_tools/build_document.md) to build documents, then copy `apache/incubator-kyuubi`'s
+   folder `docs/_build/html` to `apache/incubator-kyuubi-website`'s folder `content/docs/r{RELEASE_VERSION}`
 
 ### Create an Announcement
 
-Once everything is working create an announcement on the website and then send an e-mail to the mailing list.
+Once everything is working, create an announcement on the website and then send an e-mail to the mailing list.
+You can generate the announcement via `buld/release/script/announce.sh` automatically.
+The mailing list includes: `general@incubator.apache.org`, `announce@apache.org`, `dev@kyuubi.apache.org`, `user@spark.apache.org`.
+
+Note that, you must use the apache.org email to send announce to `announce@apache.org`.
 
 Enjoy an adult beverage of your choice, and congratulations on making a Kyuubi release.
+
+
+## Remove the dist repo directories for deprecated release candidates
+
+Remove the deprecated dist repo directories at last. 
+
+```shell
+cd work/svn-dev
+svn delete https://dist.apache.org/repos/dist/dev/incubator/kyuubi/{RELEASE_TAG} \
+  --username "${ASF_USERNAME}" \
+  --password "${ASF_PASSWORD}" \
+  --message "Remove deprecated Apache Kyuubi ${RELEASE_TAG}" 
+```

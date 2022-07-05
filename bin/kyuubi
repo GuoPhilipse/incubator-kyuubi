@@ -23,6 +23,7 @@ function usage() {
   echo "Usage: bin/kyuubi command"
   echo "  commands:"
   echo "    start        - Run a Kyuubi server as a daemon"
+  echo "    restart      - Restart Kyuubi server as a daemon"
   echo "    run          - Run a Kyuubi server in the foreground"
   echo "    stop         - Stop the Kyuubi daemon"
   echo "    status       - Show status of the Kyuubi daemon"
@@ -35,7 +36,7 @@ if [[ "$@" = *--help ]] || [[ "$@" = *-h ]]; then
 fi
 
 function kyuubi_logo() {
-  cat ${KYUUBI_HOME}/bin/kyuubi-logo | grep -v "^#"
+  source ${KYUUBI_HOME}/bin/kyuubi-logo
 }
 
 function kyuubi_rotate_log() {
@@ -62,26 +63,15 @@ function kyuubi_rotate_log() {
 
 export KYUUBI_HOME="$(cd "$(dirname "$0")"/..; pwd)"
 
-echo "Starting Kyuubi Server from ${KYUUBI_HOME}"
-
-. "${KYUUBI_HOME}/bin/load-kyuubi-env.sh"
+if [[ $1 == "start" ]] || [[ $1 == "run" ]]; then
+  . "${KYUUBI_HOME}/bin/load-kyuubi-env.sh"
+else
+  . "${KYUUBI_HOME}/bin/load-kyuubi-env.sh" -s
+fi
 
 if [[ -z ${JAVA_HOME} ]]; then
   echo "Error: JAVA_HOME IS NOT SET! CANNOT PROCEED."
   exit 1
-fi
-
-if [[ -z ${SPARK_HOME} ]]; then
-  echo "Error: SPARK_HOME IS NOT SET! CANNOT PROCEED." >&2
-  exit 1
-elif [[ ! -d ${SPARK_HOME} ]]; then
-  echo "Error: SPARK_HOME[${SPARK_HOME}] DOES NOT EXIST! CANNOT PROCEED." >&2
-  exit 1
-else
-  if [[ ! -x "${SPARK_HOME}/bin/spark-submit" ]]; then
-    echo "Error: INVALID SPARK DISTRIBUTION! CANNOT PROCEED." >&2
-    exit 1
-  fi
 fi
 
 RUNNER="${JAVA_HOME}/bin/java"
@@ -95,7 +85,12 @@ if [[ -z "$KYUUBI_JAR_DIR" ]]; then
   fi
 fi
 
-KYUUBI_CLASSPATH="${KYUUBI_JAR_DIR}/*:${KYUUBI_CONF_DIR}:${HADOOP_CONF_DIR}"
+if [[ -z ${YARN_CONF_DIR} ]]; then
+  KYUUBI_CLASSPATH="${KYUUBI_JAR_DIR}/*:${KYUUBI_CONF_DIR}:${HADOOP_CONF_DIR}"
+else
+  KYUUBI_CLASSPATH="${KYUUBI_JAR_DIR}/*:${KYUUBI_CONF_DIR}:${HADOOP_CONF_DIR}:${YARN_CONF_DIR}"
+fi
+
 cmd="${RUNNER} ${KYUUBI_JAVA_OPTS} -cp ${KYUUBI_CLASSPATH} $CLASS"
 
 pid="${KYUUBI_PID_DIR}/kyuubi-$USER-$CLASS.pid"
@@ -197,6 +192,12 @@ function check_kyuubi() {
 
 case $1 in
   (start | "")
+    start_kyuubi
+    ;;
+
+  (restart)
+    echo "Restarting Kyuubi"
+    stop_kyuubi
     start_kyuubi
     ;;
 

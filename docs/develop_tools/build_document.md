@@ -15,11 +15,6 @@
  - limitations under the License.
  -->
 
-<div align=center>
-
-![](../imgs/kyuubi_logo.png)
-
-</div>
 
 # Building Kyuubi Documentation
 
@@ -36,7 +31,7 @@ pip install virtualenv
 Switch to the `docs` root directory.
 
 ```bash
-cd $KTUUBI_HOME/docs
+cd $KYUUBI_HOME/docs
 ```
 
 Create a virtual environment named 'kyuubi' or anything you like using `virtualenv` if it's not existing.
@@ -48,25 +43,30 @@ virtualenv kyuubi
 Activate it,
 
 ```bash
- source ./kyuubi/bin/activate
+source $KYUUBI_HOME/bin/activate
 ```
 
 ## Install all dependencies
 
-Install all dependencies enumerated in the `requirements.txt`
+Install all dependencies enumerated in the `requirements.txt`.
 
 ```bash
 pip install -r requirements.txt
 ```
 
 ## Create Documentation
-
+linux & macos
 ```bash
+cd $KYUUBI_HOME
 make html
 ```
-
-If the build process succeed, the HTML pages are in `_build/html`.
+windows
+```bash
+cd $KYUUBI_HOME
+make.bat html
+```
+If the build process succeed, the HTML pages are in `$KYUUBI_HOME/_build/html`.
 
 ## View Locally
 
-Open the `_build/html/index.html` file in your favorite web browser.
+Open the `$KYUUBI_HOME/_build/html/index.html` file in your favorite web browser.

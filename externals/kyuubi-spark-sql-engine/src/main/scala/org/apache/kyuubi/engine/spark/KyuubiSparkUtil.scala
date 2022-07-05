@@ -19,17 +19,39 @@ package org.apache.kyuubi.engine.spark
 
 import java.time.{Instant, LocalDateTime, ZoneId}
 
+import scala.annotation.meta.getter
+
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.util.kvstore.KVIndex
 
-import org.apache.kyuubi.Utils
+import org.apache.kyuubi.{Logging, Utils}
 
-object KyuubiSparkUtil {
+object KyuubiSparkUtil extends Logging {
+
+  type KVIndexParam = KVIndex @getter
+
+  final val SPARK_SCHEDULER_POOL_KEY = "spark.scheduler.pool"
+  final val SPARK_SQL_EXECUTION_ID_KEY = "spark.sql.execution.id"
 
   def globalSparkContext: SparkContext = SparkSession.active.sparkContext
 
-  def engineId: String =
-    globalSparkContext.applicationAttemptId.getOrElse(globalSparkContext.applicationId)
+  def initializeSparkSession(spark: SparkSession, initializationSQLs: Seq[String]): Unit = {
+    initializationSQLs.foreach { sql =>
+      spark.sparkContext.setJobGroup(
+        "initialization sql queries",
+        sql,
+        interruptOnCancel = true)
+      debug(s"Execute initialization sql: $sql")
+      try {
+        spark.sql(sql).isEmpty
+      } finally {
+        spark.sparkContext.clearJobGroup()
+      }
+    }
+  }
+
+  def engineId: String = globalSparkContext.applicationId
 
   lazy val diagnostics: String = {
     val sc = globalSparkContext
@@ -37,6 +59,7 @@ object KyuubiSparkUtil {
       "spark.org.apache.hadoop.yarn.server.webproxy.amfilter.AmIpFilter.param.PROXY_URI_BASES")
       .orElse(sc.uiWebUrl).getOrElse("")
     // scalastyle:off line.size.limit
+    // format: off
     s"""
        |           Spark application name: ${sc.appName}
        |                 application ID: $engineId
@@ -46,6 +69,7 @@ object KyuubiSparkUtil {
        |                 version: ${sc.version}
        |           Start time: ${LocalDateTime.ofInstant(Instant.ofEpochMilli(sc.startTime), ZoneId.systemDefault)}
        |           User: ${sc.sparkUser}""".stripMargin
+    // format: on
     // scalastyle:on line.size.limit
   }
 

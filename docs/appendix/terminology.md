@@ -15,12 +15,6 @@
  - limitations under the License.
  -->
 
-<div align=center>
-
-![](../imgs/kyuubi_logo.png)
-
-</div>
-
 # Terminologies
 
 ## Kyuubi
@@ -44,7 +38,7 @@ Kyuubi is a unified multi-tenant JDBC interface for large-scale data processing 
 
 Typically, there is a gap between business development and big data analytics.
 If the two are forcefully coupled, it would make the corresponding system difficult to operate and optimize.
-One the flip side, if decoupled, the values of both can be maximized.
+On the flip side, if decoupled, the values of both can be maximized.
 Business experts can stay focused on their own business development,
 while Big Data engineers can continuously optimize server-side performance and stability.
 Kyuubi combines the two seamlessly through an easy-to-use JDBC interface.
@@ -84,7 +78,7 @@ A ServerSpace is used to register servers and expose them together as a service 
 ### Engine
 
 An engine handles all queries through Kyuubi servers.
-It is created one Kyuubi server and can be shared with other Kyuubi servers by registering itself to an engine namespace.
+It is created in one Kyuubi server and can be shared with other Kyuubi servers by registering itself to an engine namespace.
 All its capabilities are mainly powered by Spark SQL.
 
 _**Aliases: Query Engine / Engine Instance / e.i.**_

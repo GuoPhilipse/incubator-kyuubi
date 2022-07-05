@@ -24,12 +24,15 @@ import java.nio.file.{Files, Path, Paths}
 import java.util.{Properties, TimeZone, UUID}
 
 import scala.collection.JavaConverters._
+import scala.util.control.NonFatal
+import scala.util.matching.Regex
 
 import org.apache.commons.lang3.SystemUtils
 import org.apache.commons.lang3.time.DateFormatUtils
 import org.apache.hadoop.security.UserGroupInformation
 import org.apache.hadoop.util.ShutdownHookManager
 
+import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.config.internal.Tests.IS_TESTING
 
 object Utils extends Logging {
@@ -48,7 +51,7 @@ object Utils extends Logging {
   def getDefaultPropertiesFile(env: Map[String, String] = sys.env): Option[File] = {
     env.get(KYUUBI_CONF_DIR)
       .orElse(env.get(KYUUBI_HOME).map(_ + File.separator + "conf"))
-      .map( d => new File(d + File.separator + KYUUBI_CONF_FILE_NAME))
+      .map(d => new File(d + File.separator + KYUUBI_CONF_FILE_NAME))
       .filter(_.exists())
       .orElse {
         Option(getClass.getClassLoader.getResource(KYUUBI_CONF_FILE_NAME)).map { url =>
@@ -74,7 +77,8 @@ object Utils extends Logging {
       } catch {
         case e: IOException =>
           throw new KyuubiException(
-            s"Failed when loading Kyuubi properties from ${f.getAbsolutePath}", e)
+            s"Failed when loading Kyuubi properties from ${f.getAbsolutePath}",
+            e)
       }
     }.getOrElse(Map.empty)
   }
@@ -96,8 +100,23 @@ object Utils extends Logging {
         case e: IOException => error = e
       }
     }
-    throw new IOException("Failed to create a temp directory (under " + root + ") after " +
-      MAX_DIR_CREATION_ATTEMPTS + " attempts!", error)
+    throw new IOException(
+      "Failed to create a temp directory (under " + root + ") after " + MAX_DIR_CREATION_ATTEMPTS +
+        " attempts!",
+      error)
+  }
+
+  def getAbsolutePathFromWork(pathStr: String, env: Map[String, String] = sys.env): Path = {
+    val path = Paths.get(pathStr)
+    if (path.isAbsolute) {
+      path
+    } else {
+      val workDir = env.get("KYUUBI_WORK_DIR_ROOT") match {
+        case Some(dir) => dir
+        case _ => System.getProperty("user.dir")
+      }
+      Paths.get(workDir, pathStr)
+    }
   }
 
   /**
@@ -185,6 +204,9 @@ object Utils extends Logging {
   // The value follows org.apache.spark.util.ShutdownHookManager.SPARK_CONTEXT_SHUTDOWN_PRIORITY
   // Hooks need to be invoked before the SparkContext stopped shall use a higher priority.
   val SPARK_CONTEXT_SHUTDOWN_PRIORITY = 50
+  val FLINK_ENGINE_SHUTDOWN_PRIORITY = 50
+  val TRINO_ENGINE_SHUTDOWN_PRIORITY = 50
+  val JDBC_ENGINE_SHUTDOWN_PRIORITY = 50
 
   /**
    * Add some operations that you want into ShutdownHook
@@ -239,5 +261,82 @@ object Utils extends Logging {
     e.printStackTrace(wrt)
     wrt.close()
     stm.toString
+  }
+
+  def tryLogNonFatalError(block: => Unit): Unit = {
+    try {
+      block
+    } catch {
+      case NonFatal(t) =>
+        error(s"Uncaught exception in thread ${Thread.currentThread().getName}", t)
+    }
+  }
+
+  def getCodeSourceLocation(clazz: Class[_]): String = {
+    new File(clazz.getProtectionDomain.getCodeSource.getLocation.toURI).getPath
+  }
+
+  def fromCommandLineArgs(args: Array[String], conf: KyuubiConf): Unit = {
+    require(args.length % 2 == 0, s"Illegal size of arguments.")
+    for (i <- args.indices by 2) {
+      require(
+        args(i) == "--conf",
+        s"Unrecognized main arguments prefix ${args(i)}," +
+          s"the argument format is '--conf k=v'.")
+
+      args(i + 1).split("=", 2).map(_.trim) match {
+        case seq if seq.length == 2 => conf.set(seq.head, seq.last)
+        case _ => throw new IllegalArgumentException(s"Illegal argument: ${args(i + 1)}.")
+      }
+    }
+  }
+
+  val REDACTION_REPLACEMENT_TEXT = "*********(redacted)"
+
+  private val PATTERN_FOR_KEY_VALUE_ARG = "(.+?)=(.+)".r
+
+  def redactCommandLineArgs(conf: KyuubiConf, commands: Array[String]): Array[String] = {
+    val redactionPattern = conf.get(SERVER_SECRET_REDACTION_PATTERN)
+    var nextKV = false
+    commands.map {
+      case PATTERN_FOR_KEY_VALUE_ARG(key, value) if nextKV =>
+        val (_, newValue) = redact(redactionPattern, Seq((key, value))).head
+        nextKV = false
+        s"$key=$newValue"
+
+      case cmd if cmd == "--conf" =>
+        nextKV = true
+        cmd
+
+      case cmd =>
+        cmd
+    }
+  }
+
+  /**
+   * Redact the sensitive values in the given map. If a map key matches the redaction pattern then
+   * its value is replaced with a dummy text.
+   */
+  def redact[K, V](regex: Option[Regex], kvs: Seq[(K, V)]): Seq[(K, V)] = {
+    regex match {
+      case None => kvs
+      case Some(r) => redact(r, kvs)
+    }
+  }
+
+  private def redact[K, V](redactionPattern: Regex, kvs: Seq[(K, V)]): Seq[(K, V)] = {
+    kvs.map {
+      case (key: String, value: String) =>
+        redactionPattern.findFirstIn(key)
+          .orElse(redactionPattern.findFirstIn(value))
+          .map { _ => (key, REDACTION_REPLACEMENT_TEXT) }
+          .getOrElse((key, value))
+      case (key, value: String) =>
+        redactionPattern.findFirstIn(value)
+          .map { _ => (key, REDACTION_REPLACEMENT_TEXT) }
+          .getOrElse((key, value))
+      case (key, value) =>
+        (key, value)
+    }.asInstanceOf[Seq[(K, V)]]
   }
 }

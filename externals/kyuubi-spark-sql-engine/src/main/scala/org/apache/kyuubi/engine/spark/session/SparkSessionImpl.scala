@@ -18,25 +18,56 @@
 package org.apache.kyuubi.engine.spark.session
 
 import org.apache.hive.service.rpc.thrift.TProtocolVersion
+import org.apache.spark.sql.{AnalysisException, SparkSession}
 
-import org.apache.kyuubi.engine.spark.events.{EventLoggingService, SessionEvent}
+import org.apache.kyuubi.engine.spark.events.SessionEvent
+import org.apache.kyuubi.engine.spark.operation.SparkSQLOperationManager
+import org.apache.kyuubi.engine.spark.shim.SparkCatalogShim
+import org.apache.kyuubi.engine.spark.udf.KDFRegistry
+import org.apache.kyuubi.events.EventBus
 import org.apache.kyuubi.operation.{Operation, OperationHandle}
-import org.apache.kyuubi.session.{AbstractSession, SessionHandle, SessionManager}
+import org.apache.kyuubi.session.{AbstractSession, SessionManager}
 
 class SparkSessionImpl(
     protocol: TProtocolVersion,
     user: String,
     password: String,
+    serverIpAddress: String,
     ipAddress: String,
     conf: Map[String, String],
-    sessionManager: SessionManager)
+    sessionManager: SessionManager,
+    val spark: SparkSession)
   extends AbstractSession(protocol, user, password, ipAddress, conf, sessionManager) {
-  override val handle: SessionHandle = SessionHandle(protocol)
+
+  private def setModifiableConfig(key: String, value: String): Unit = {
+    try {
+      spark.conf.set(key, value)
+    } catch {
+      case e: AnalysisException => warn(e.getMessage())
+    }
+  }
 
   private val sessionEvent = SessionEvent(this)
 
+  def serverIpAddress(): String = serverIpAddress
+
   override def open(): Unit = {
-    EventLoggingService.onEvent(sessionEvent)
+    normalizedConf.foreach {
+      case ("use:database", database) =>
+        try {
+          SparkCatalogShim().setCurrentDatabase(spark, database)
+        } catch {
+          case e
+              if database == "default" && e.getMessage != null &&
+                e.getMessage.contains("not found") =>
+          // use:database is from hive so the catalog is always session catalog which must have
+          // default namespace `default`. But as spark support v2 catalog, catalog may not have
+          // default namespace. Here we do nothing for compatible both session and v2 catalog.
+        }
+      case (key, value) => setModifiableConfig(key, value)
+    }
+    KDFRegistry.registerAll(spark)
+    EventBus.post(sessionEvent)
     super.open()
   }
 
@@ -47,8 +78,9 @@ class SparkSessionImpl(
 
   override def close(): Unit = {
     sessionEvent.endTime = System.currentTimeMillis()
-    EventLoggingService.onEvent(sessionEvent)
+    EventBus.post(sessionEvent)
     super.close()
+    spark.sessionState.catalog.getTempViewNames().foreach(spark.catalog.uncacheTable(_))
+    sessionManager.operationManager.asInstanceOf[SparkSQLOperationManager].closeILoop(handle)
   }
-
 }

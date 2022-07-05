@@ -1,4 +1,21 @@
-name: Kyuubi
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: CI
 
 on:
   push:
@@ -10,149 +27,256 @@ on:
       - master
       - branch-*
 
-jobs:
-  rat:
-    name: Check License
-    runs-on: ubuntu-20.04
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-java@v1
-        with:
-          java-version: '1.8'
-      - run: build/mvn org.apache.rat:apache-rat-plugin:check
-      - name: Upload rat report
-        if: failure()
-        uses: actions/upload-artifact@v2
-        with:
-          name: rat
-          path: "**/target/rat*.txt"
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
 
-  build:
-    name: Build
+env:
+  MVN_OPT: -Dmaven.javadoc.skip=true -Drat.skip=true -Dscalastyle.skip=true -Dspotless.check.skip -Dorg.slf4j.simpleLogger.defaultLogLevel=warn
+
+jobs:
+  default:
+    name: Kyuubi and Spark Test
     runs-on: ubuntu-20.04
     strategy:
+      fail-fast: false
       matrix:
+        java:
+          - 8
+          - 11
+        spark:
+          - '3.0'
+          - '3.1'
+          - '3.2'
+          - '3.3'
+        spark-archive: [""]
+        exclude-tags: [""]
+        comment: ["normal"]
         include:
           - java: 8
-            spark: '3.0'
-            spark-hadoop: '2.7'
-          - java: 8
-            spark: '3.1'
-            spark-hadoop: '2.7'
-            profiles: '-Dspark.archive.mirror=https://archive.apache.org/dist/spark/spark-3.0.3 -Dspark.archive.name=spark-3.0.3-bin-hadoop2.7.tgz -Dmaven.plugin.scalatest.exclude.tags=org.apache.kyuubi.tags.ExtendedSQLTest,org.apache.kyuubi.tags.DeltaTest,org.apache.kyuubi.tags.IcebergTest'
-          - java: 8
-            spark: '3.1'
-            spark-hadoop: '3.2'
-            profiles: '-Pkyuubi-extension-spark-3-1'
-            codecov: 'true'
+            spark: '3.2'
+            spark-archive: '-Dspark.archive.mirror=https://archive.apache.org/dist/spark/spark-3.0.3 -Dspark.archive.name=spark-3.0.3-bin-hadoop2.7.tgz'
+            exclude-tags: '-Dmaven.plugin.scalatest.exclude.tags=org.scalatest.tags.Slow,org.apache.kyuubi.tags.DeltaTest,org.apache.kyuubi.tags.HudiTest,org.apache.kyuubi.tags.IcebergTest'
+            comment: 'verify-spark-3.0'
           - java: 8
             spark: '3.2'
-            spark-hadoop: '3.2'
-            profiles: '-Pkyuubi-extension-spark-3-2'
-          - java: 11
-            spark: '3.1'
-            spark-hadoop: '3.2'
-            profiles: '-DskipTests -Pspark-provided'
-
+            spark-archive: '-Dspark.archive.mirror=https://archive.apache.org/dist/spark/spark-3.1.3 -Dspark.archive.name=spark-3.1.3-bin-hadoop3.2.tgz'
+            exclude-tags: '-Dmaven.plugin.scalatest.exclude.tags=org.scalatest.tags.Slow,org.apache.kyuubi.tags.DeltaTest,org.apache.kyuubi.tags.HudiTest,org.apache.kyuubi.tags.IcebergTest'
+            comment: 'verify-spark-3.1'
+          - java: 8
+            spark: '3.2'
+            spark-archive: '-Dspark.archive.mirror=https://archive.apache.org/dist/spark/spark-3.3.0 -Dspark.archive.name=spark-3.3.0-bin-hadoop3.tgz'
+            exclude-tags: '-Dmaven.plugin.scalatest.exclude.tags=org.scalatest.tags.Slow,org.apache.kyuubi.tags.DeltaTest,org.apache.kyuubi.tags.HudiTest,org.apache.kyuubi.tags.IcebergTest'
+            comment: 'verify-spark-3.3'
     env:
       SPARK_LOCAL_IP: localhost
     steps:
       - uses: actions/checkout@v2
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
       - name: Setup JDK ${{ matrix.java }}
-        uses: actions/setup-java@v1
+        uses: actions/setup-java@v2
         with:
+          distribution: zulu
           java-version: ${{ matrix.java }}
-      - uses: actions/cache@v1
-        with:
-          path: ~/.m2/repository/com
-          key: ${{ runner.os }}-maven-com-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-com-
-      - uses: actions/cache@v1
-        with:
-          path: ~/.m2/repository/org
-          key: ${{ runner.os }}-maven-org-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-org-
-      - uses: actions/cache@v1
-        with:
-          path: ~/.m2/repository/net
-          key: ${{ runner.os }}-maven-net-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-net-
-      - uses: actions/cache@v1
-        with:
-          path: ~/.m2/repository/io
-          key: ${{ runner.os }}-maven-io-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-io-
-      - name: Build with Maven
-        run: >-
-          ./build/mvn clean install -Dmaven.javadoc.skip=true -V
-          -Pspark-${{ matrix.spark }} -Pspark-hadoop-${{ matrix.spark-hadoop }} ${{ matrix.profiles }}
+          cache: 'maven'
+          check-latest: false
+      - name: Build and test Kyuubi and Spark with maven w/o linters
+        run: |
+          TEST_MODULES="dev/kyuubi-codecov"
+          ./build/mvn clean install ${MVN_OPT} -pl ${TEST_MODULES} -am \
+          -Pspark-${{ matrix.spark }} ${{ matrix.spark-archive }} ${{ matrix.exclude-tags }}
       - name: Code coverage
-        if: ${{ matrix.codecov == 'true' }}
+        if: |
+          matrix.java == 8 &&
+          matrix.spark == '3.2' &&
+          matrix.spark-archive == ''
         uses: codecov/codecov-action@v2
         with:
           verbose: true
-      - name: Detected Dependency List Change
-        if: ${{ matrix.java == 8 }}
-        run: build/dependency.sh
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v2
         with:
-          name: unit-tests-log
+          name: unit-tests-log-java-${{ matrix.java }}-spark-${{ matrix.spark }}-${{ matrix.comment }}
           path: |
             **/target/unit-tests.log
             **/kyuubi-spark-sql-engine.log*
-            **/target/scalastyle-output.xml
 
-  tpcds:
-    name: TPC-DS Tests
+  flink-it:
+    name: Flink Test
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+          - 8
+          - 11
+        flink:
+          - '1.14'
+          # - '1.15' FIXME
+        flink-archive: [ "" ]
+        comment: [ "normal" ]
+        # include: FIXME
+        #   - java: 8
+        #     flink: '1.15'
+        #     flink-archive: '-Dflink.archive.mirror=https://archive.apache.org/dist/flink/flink-1.15.0 -Dspark.archive.name=flink-1.15.0-bin-scala_2.12.tgz'
+        #     comment: 'verify-flink-1.15'
+    steps:
+      - uses: actions/checkout@v2
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+      - name: Setup JDK ${{ matrix.java }}
+        uses: actions/setup-java@v2
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+          cache: 'maven'
+          check-latest: false
+      - name: Build and test Flink with maven w/o linters
+        run: |       
+          TEST_MODULES="externals/kyuubi-flink-sql-engine,integration-tests/kyuubi-flink-it"
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} -Pflink-${{ matrix.flink }} ${{ matrix.flink-archive }} -am  clean install -DskipTests
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} -Pflink-${{ matrix.flink }} ${{ matrix.flink-archive }} test
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v2
+        with:
+          name: unit-tests-log-java-${{ matrix.java }}-flink-${{ matrix.flink }}-${{ matrix.comment }}
+          path: |
+            **/target/unit-tests.log
+            **/kyuubi-flink-sql-engine.log*
+
+  hive-it:
+    name: Hive Test
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+          - 8
+        comment: [ "normal" ]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+      - name: Setup JDK ${{ matrix.java }}
+        uses: actions/setup-java@v2
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+          cache: 'maven'
+          check-latest: false
+      - name: Build and test Hive with maven w/o linters
+        run: |
+          TEST_MODULES="externals/kyuubi-hive-sql-engine,integration-tests/kyuubi-hive-it"
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} -am clean install -DskipTests
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} test
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v2
+        with:
+          name: unit-tests-log-java-${{ matrix.java }}-hive-${{ matrix.comment }}
+          path: |
+            **/target/unit-tests.log
+            **/kyuubi-hive-sql-engine.log*
+
+  jdbc-it:
+    name: JDBC Test
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+          - 8
+          - 11
+        comment: [ "normal" ]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+      - name: Setup JDK ${{ matrix.java }}
+        uses: actions/setup-java@v2
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+          cache: 'maven'
+          check-latest: false
+      - name: Build and test JDBC with maven w/o linters
+        run: |
+          TEST_MODULES="externals/kyuubi-jdbc-engine" || echo 'TODO integration-tests/kyuubi-jdbc-it'
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} -am clean install -DskipTests
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} test
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v2
+        with:
+          name: unit-tests-log-java-${{ matrix.java }}-hive-${{ matrix.comment }}
+          path: |
+            **/target/unit-tests.log
+            **/kyuubi-jdbc-engine.log*
+
+  trino-it:
+    name: Trino Test
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+          - 8
+          - 11
+        comment: [ "normal" ]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+      - name: Setup JDK ${{ matrix.java }}
+        uses: actions/setup-java@v2
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+          cache: 'maven'
+          check-latest: false
+      - name: Build and test Trino with maven w/o linters
+        run: |
+          TEST_MODULES="externals/kyuubi-trino-engine,integration-tests/kyuubi-trino-it"
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} -am clean install -DskipTests
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} test
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v2
+        with:
+          name: unit-tests-log-java-${{ matrix.java }}-trino-${{ matrix.comment }}
+          path: |
+            **/target/unit-tests.log
+            **/kyuubi-trino-engine.log*
+
+  tpch-tpcds:
+    name: TPC-H and TPC-DS Tests
     runs-on: ubuntu-20.04
     env:
       SPARK_LOCAL_IP: localhost
     steps:
       - uses: actions/checkout@v2
-      - name: Setup JDK 1.8
-        uses: actions/setup-java@v1
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+      - name: Setup JDK 8
+        uses: actions/setup-java@v2
         with:
-          java-version: '1.8'
-      - uses: actions/cache@v1
-        with:
-          path: ~/.m2/repository/com
-          key: ${{ runner.os }}-maven-com-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-com-
-      - uses: actions/cache@v1
-        with:
-          path: ~/.m2/repository/org
-          key: ${{ runner.os }}-maven-org-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-org-
-      - uses: actions/cache@v1
-        with:
-          path: ~/.m2/repository/net
-          key: ${{ runner.os }}-maven-net-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-net-
-      - uses: actions/cache@v1
-        with:
-          path: ~/.m2/repository/io
-          key: ${{ runner.os }}-maven-io-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-io-
+          distribution: zulu
+          java-version: 8
+          cache: 'maven'
+          check-latest: false
       - name: Run TPC-DS Tests
-        run: >-
-          ./build/mvn clean install -Dmaven.javadoc.skip=true -V
-          -pl kyuubi-server -am
-          -Pspark-3.1
-          -Dmaven.plugin.scalatest.exclude.tags=''
-          -Dtest=none -DwildcardSuites=org.apache.kyuubi.operation.tpcds
+        run: |
+          TEST_MODULES="kyuubi-server,extensions/spark/kyuubi-spark-connector-tpcds,extensions/spark/kyuubi-spark-connector-tpch"
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} -am clean install -DskipTests
+          ./build/mvn ${MVN_OPT} -pl ${TEST_MODULES} test \
+          -Dmaven.plugin.scalatest.exclude.tags='' \
+          -Dtest=none -DwildcardSuites=org.apache.kyuubi.operation.tpcds,org.apache.kyuubi.spark.connector.tpcds.TPCDSQuerySuite,org.apache.kyuubi.spark.connector.tpch.TPCHQuerySuite
 
-  minikube-it:
-    name: Minikube Integration Test
+  kyuubi-on-k8s-it:
+    name: Kyuubi Server On Kubernetes Integration Test
     runs-on: ubuntu-20.04
     steps:
       - name: Checkout
@@ -166,34 +290,75 @@ jobs:
           # passthrough CI into build container
           build-args: CI=${CI}
           context: .
-          file: docker/Dockerfile
+          file: build/Dockerfile
           load: true
           tags: apache/kyuubi:latest
       # from https://github.com/marketplace/actions/setup-minikube-kubernetes-cluster
       - name: Setup Minikube
-        uses: manusa/actions-setup-minikube@v2.4.2
+        uses: manusa/actions-setup-minikube@v2.4.3
         with:
-          minikube version: 'v1.16.0'
-          kubernetes version: 'v1.19.2'
+          minikube version: 'v1.25.2'
+          kubernetes version: 'v1.23.3'
       - name: kubectl pre-check
         run: |
           kubectl get serviceaccount
           kubectl create serviceaccount kyuubi
           kubectl get serviceaccount
       - name: start kyuubi
-        run: kubectl apply -f kubernetes/integration-tests/test-k8s.yaml
+        run: kubectl apply -f integration-tests/kyuubi-kubernetes-it/src/test/resources/kyuubi-server.yaml
       - name: kyuubi pod check
         run: kubectl get pods
       - name: integration tests
         run: >-
-          ./build/mvn clean install -Dmaven.javadoc.skip=true -V
-          -pl kubernetes/integration-tests -am
-          -Pkubernetes
-          -Dtest=none -DwildcardSuites=org.apache.kyuubi.kubernetes.test
+          ./build/mvn ${MVN_OPT} clean install
+          -pl integration-tests/kyuubi-kubernetes-it -am
+          -Pkubernetes-it
+          -Dtest=none -DwildcardSuites=org.apache.kyuubi.kubernetes.test.deployment
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v2
         with:
-          name: unit-tests-log
+          name: unit-tests-log-kyuubi-on-k8s-it
           path: |
             **/target/unit-tests.log
+
+  spark-on-k8s-it:
+    name: Spark Engine On Kubernetes Integration Test
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      # from https://github.com/marketplace/actions/setup-minikube-kubernetes-cluster
+      - name: Setup Minikube
+        uses: manusa/actions-setup-minikube@v2.4.3
+        with:
+          minikube version: 'v1.25.2'
+          kubernetes version: 'v1.23.3'
+          driver: docker
+          start args: '--extra-config=kubeadm.ignore-preflight-errors=NumCPU --force --cpus 2 --memory 4096'
+      # in case: https://spark.apache.org/docs/latest/running-on-kubernetes.html#rbac
+      - name: Create Service Account
+        run: |
+          kubectl create serviceaccount spark
+          kubectl create clusterrolebinding spark-role --clusterrole=edit --serviceaccount=default:spark --namespace=default
+          kubectl get serviceaccount
+      - name: integration tests
+        run: >-
+          ./build/mvn ${MVN_OPT} clean install
+          -Dspark.version=3.2.1
+          -Pflink-provided,hive-provided
+          -Pkubernetes-it
+          -Dtest=none -DwildcardSuites=org.apache.kyuubi.kubernetes.test.spark
+      - name: Print Driver Pod logs
+        if: failure()
+        run: |
+          kubectl get pods
+          kubectl get pods | grep driver | awk -F " " '{print$1}' | xargs -I {} kubectl logs {}
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v2
+        with:
+          name: unit-tests-log-spark-on-k8s-it
+          path: |
+            **/target/unit-tests.log
+            **/kyuubi-spark-sql-engine.log*

@@ -22,6 +22,7 @@ import scala.collection.JavaConverters._
 import org.apache.hive.service.rpc.thrift.{TGetInfoType, TGetInfoValue, TProtocolVersion, TRowSet, TTableSchema}
 
 import org.apache.kyuubi.{KyuubiSQLException, Logging}
+import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.operation.{Operation, OperationHandle}
 import org.apache.kyuubi.operation.FetchOrientation.FetchOrientation
 import org.apache.kyuubi.operation.log.OperationLog
@@ -33,10 +34,11 @@ abstract class AbstractSession(
     val ipAddress: String,
     val conf: Map[String, String],
     val sessionManager: SessionManager) extends Session with Logging {
+  override val handle: SessionHandle = SessionHandle()
 
   protected def logSessionInfo(msg: String): Unit = info(s"[$user:$ipAddress] $handle - $msg")
 
-  private final val _createTime: Long = System.currentTimeMillis()
+  final private val _createTime: Long = System.currentTimeMillis()
   override def createTime: Long = _createTime
 
   @volatile private var _lastAccessTime: Long = _createTime
@@ -51,12 +53,15 @@ abstract class AbstractSession(
 
   val normalizedConf: Map[String, String] = sessionManager.validateAndNormalizeConf(conf)
 
-  private final val opHandleSet = new java.util.HashSet[OperationHandle]
+  override lazy val name: Option[String] = normalizedConf.get(KyuubiConf.SESSION_NAME.key)
+
+  final private val opHandleSet = new java.util.HashSet[OperationHandle]
 
   private def acquire(userAccess: Boolean): Unit = synchronized {
     if (userAccess) {
       _lastAccessTime = System.currentTimeMillis
     }
+    _lastIdleTime = 0
   }
 
   private def release(userAccess: Boolean): Unit = {
@@ -65,14 +70,13 @@ abstract class AbstractSession(
     }
     if (opHandleSet.isEmpty) {
       _lastIdleTime = System.currentTimeMillis
-    } else {
-      _lastIdleTime = 0
     }
   }
 
   private def withAcquireRelease[T](userAccess: Boolean = true)(f: => T): T = {
     acquire(userAccess)
-    try f finally release(userAccess)
+    try f
+    finally release(userAccess)
   }
 
   override def close(): Unit = withAcquireRelease() {
@@ -89,11 +93,12 @@ abstract class AbstractSession(
   protected def runOperation(operation: Operation): OperationHandle = {
     try {
       val opHandle = operation.getHandle
-      operation.run()
       opHandleSet.add(opHandle)
+      operation.run()
       opHandle
     } catch {
       case e: KyuubiSQLException =>
+        opHandleSet.remove(operation.getHandle)
         sessionManager.operationManager.closeOperation(operation.getHandle)
         throw e
     }
@@ -101,22 +106,24 @@ abstract class AbstractSession(
 
   override def getInfo(infoType: TGetInfoType): TGetInfoValue = withAcquireRelease() {
     infoType match {
-      case TGetInfoType.CLI_SERVER_NAME => TGetInfoValue.stringValue("Kyuubi")
-      case TGetInfoType.CLI_DBMS_NAME => TGetInfoValue.stringValue("Spark SQL")
+      case TGetInfoType.CLI_SERVER_NAME => TGetInfoValue.stringValue("Apache Kyuubi (Incubating)")
+      case TGetInfoType.CLI_DBMS_NAME => TGetInfoValue.stringValue("Apache Kyuubi (Incubating)")
       case TGetInfoType.CLI_DBMS_VER => TGetInfoValue.stringValue(org.apache.kyuubi.KYUUBI_VERSION)
+      case TGetInfoType.CLI_ODBC_KEYWORDS => TGetInfoValue.stringValue("Unimplemented")
       case TGetInfoType.CLI_MAX_COLUMN_NAME_LEN |
-           TGetInfoType.CLI_MAX_SCHEMA_NAME_LEN |
-           TGetInfoType.CLI_MAX_TABLE_NAME_LEN => TGetInfoValue.lenValue(128)
+          TGetInfoType.CLI_MAX_SCHEMA_NAME_LEN |
+          TGetInfoType.CLI_MAX_TABLE_NAME_LEN => TGetInfoValue.lenValue(128)
       case _ => throw KyuubiSQLException(s"Unrecognized GetInfoType value: $infoType")
     }
   }
 
   override def executeStatement(
       statement: String,
+      confOverlay: Map[String, String],
       runAsync: Boolean,
       queryTimeout: Long): OperationHandle = withAcquireRelease() {
     val operation = sessionManager.operationManager
-      .newExecuteStatementOperation(this, statement, runAsync, queryTimeout)
+      .newExecuteStatementOperation(this, statement, confOverlay, runAsync, queryTimeout)
     runOperation(operation)
   }
 
@@ -170,6 +177,40 @@ abstract class AbstractSession(
     runOperation(operation)
   }
 
+  override def getPrimaryKeys(
+      catalogName: String,
+      schemaName: String,
+      tableName: String): OperationHandle = {
+    val operation = sessionManager.operationManager
+      .newGetPrimaryKeysOperation(this, catalogName, schemaName, tableName)
+    runOperation(operation)
+  }
+
+  override def getCrossReference(
+      primaryCatalog: String,
+      primarySchema: String,
+      primaryTable: String,
+      foreignCatalog: String,
+      foreignSchema: String,
+      foreignTable: String): OperationHandle = {
+    val operation = sessionManager.operationManager
+      .newGetCrossReferenceOperation(
+        this,
+        primaryCatalog,
+        primarySchema,
+        primaryTable,
+        foreignCatalog,
+        foreignSchema,
+        foreignTable)
+    runOperation(operation)
+  }
+
+  override def getQueryId(operationHandle: OperationHandle): String = {
+    val operation = sessionManager.operationManager.getOperation(operationHandle)
+    val queryId = sessionManager.operationManager.getQueryId(operation)
+    queryId
+  }
+
   override def cancelOperation(operationHandle: OperationHandle): Unit = withAcquireRelease() {
     sessionManager.operationManager.cancelOperation(operationHandle)
   }
@@ -196,7 +237,7 @@ abstract class AbstractSession(
     }
   }
 
-  override def closeExpiredOperations: Unit = {
+  override def closeExpiredOperations(): Unit = {
     val operations = sessionManager.operationManager
       .removeExpiredOperations(opHandleSet.asScala.toSeq)
     operations.foreach { op =>

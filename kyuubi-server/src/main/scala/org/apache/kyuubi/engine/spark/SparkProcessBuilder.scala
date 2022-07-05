@@ -17,126 +17,73 @@
 
 package org.apache.kyuubi.engine.spark
 
-import java.io.{File, FilenameFilter, IOException}
-import java.net.URI
-import java.nio.file.{Files, Path, Paths}
+import java.io.{File, IOException}
+import java.nio.file.Paths
 
 import scala.collection.mutable.ArrayBuffer
 
+import com.google.common.annotations.VisibleForTesting
 import org.apache.hadoop.security.UserGroupInformation
 
 import org.apache.kyuubi._
 import org.apache.kyuubi.config.KyuubiConf
-import org.apache.kyuubi.config.KyuubiConf.ENGINE_SPARK_MAIN_RESOURCE
-import org.apache.kyuubi.engine.ProcBuilder
+import org.apache.kyuubi.engine.{KyuubiApplicationManager, ProcBuilder}
+import org.apache.kyuubi.ha.HighAvailabilityConf
+import org.apache.kyuubi.ha.client.AuthTypes
+import org.apache.kyuubi.operation.log.OperationLog
 
 class SparkProcessBuilder(
     override val proxyUser: String,
-    override val conf: KyuubiConf)
+    override val conf: KyuubiConf,
+    val engineRefId: String,
+    val extraEngineLog: Option[OperationLog] = None)
   extends ProcBuilder with Logging {
+
+  @VisibleForTesting
+  def this(proxyUser: String, conf: KyuubiConf) {
+    this(proxyUser, conf, "")
+  }
 
   import SparkProcessBuilder._
 
-  override protected val executable: String = {
-    val sparkHomeOpt = env.get("SPARK_HOME").orElse {
-      val cwd = getClass.getProtectionDomain.getCodeSource.getLocation.getPath
-        .split("kyuubi-server")
-      assert(cwd.length > 1)
-      Option(
-        Paths.get(cwd.head)
-          .resolve("externals")
-          .resolve("kyuubi-download")
-          .resolve("target")
-          .toFile
-          .listFiles(new FilenameFilter {
-            override def accept(dir: File, name: String): Boolean = {
-              dir.isDirectory && name.startsWith("spark-")}}))
-        .flatMap(_.headOption)
-        .map(_.getAbsolutePath)
-    }
+  private val sparkHome = getEngineHome(shortName)
 
-    sparkHomeOpt.map{ dir =>
-      Paths.get(dir, "bin", SPARK_SUBMIT_FILE).toAbsolutePath.toFile.getCanonicalPath
-    }.getOrElse {
-      throw KyuubiSQLException("SPARK_HOME is not set! " +
-        "For more detail information on installing and configuring Spark, please visit " +
-        "https://kyuubi.apache.org/docs/stable/deployment/settings.html#environments")
-    }
+  override protected val executable: String = {
+    Paths.get(sparkHome, "bin", SPARK_SUBMIT_FILE).toFile.getCanonicalPath
   }
 
   override def mainClass: String = "org.apache.kyuubi.engine.spark.SparkSQLEngine"
 
-  override def mainResource: Option[String] = {
-    // 1. get the main resource jar for user specified config first
-    // TODO use SPARK_SCALA_VERSION instead of SCALA_COMPILE_VERSION
-    val jarName = s"${module}_$SCALA_COMPILE_VERSION-$KYUUBI_VERSION.jar"
-    conf.get(ENGINE_SPARK_MAIN_RESOURCE).filter { userSpecified =>
-      // skip check exist if not local file.
-      val uri = new URI(userSpecified)
-      val schema = if (uri.getScheme != null) uri.getScheme else "file"
-      schema match {
-        case "file" => Files.exists(Paths.get(userSpecified))
-        case _ => true
-      }
-    }.orElse {
-      // 2. get the main resource jar from system build default
-      env.get(KyuubiConf.KYUUBI_HOME)
-        .map { Paths.get(_, "externals", "engines", "spark", jarName) }
-        .filter(Files.exists(_)).map(_.toAbsolutePath.toFile.getCanonicalPath)
-    }.orElse {
-      // 3. get the main resource from dev environment
-      Option(Paths.get("externals", module, "target", jarName))
-        .filter(Files.exists(_)).orElse {
-        Some(Paths.get("..", "externals", module, "target", jarName))
-      }.map(_.toAbsolutePath.toFile.getCanonicalPath)
-    }
-  }
-
-  override protected val workingDir: Path = {
-    env.get("KYUUBI_WORK_DIR_ROOT").map { root =>
-      val workingRoot = Paths.get(root).toAbsolutePath
-      if (!Files.exists(workingRoot)) {
-        debug(s"Creating KYUUBI_WORK_DIR_ROOT at $workingRoot")
-        Files.createDirectories(workingRoot)
-      }
-      if (Files.isDirectory(workingRoot)) {
-        workingRoot.toString
-      } else null
-    }.map { rootAbs =>
-      val working = Paths.get(rootAbs, proxyUser)
-      if (!Files.exists(working)) {
-        debug(s"Creating $proxyUser's working directory at $working")
-        Files.createDirectories(working)
-      }
-      if (Files.isDirectory(working)) {
-        working
-      } else {
-        Utils.createTempDir(rootAbs, proxyUser)
-      }
-    }.getOrElse {
-      Utils.createTempDir(namePrefix = proxyUser)
-    }
-  }
-
-  override protected def commands: Array[String] = {
+  override protected val commands: Array[String] = {
+    KyuubiApplicationManager.tagApplication(engineRefId, shortName, clusterManager(), conf)
     val buffer = new ArrayBuffer[String]()
     buffer += executable
     buffer += CLASS
     buffer += mainClass
+
+    var allConf = conf.getAll
+
+    // if enable sasl kerberos authentication for zookeeper, need to upload the server keytab file
+    if (AuthTypes.withName(conf.get(HighAvailabilityConf.HA_ZK_ENGINE_AUTH_TYPE))
+        == AuthTypes.KERBEROS) {
+      allConf = allConf ++ zkAuthKeytabFileConf(allConf)
+    }
+
     /**
      * Converts kyuubi configs to configs that Spark could identify.
      * - If the key is start with `spark.`, keep it AS IS as it is a Spark Conf
      * - If the key is start with `hadoop.`, it will be prefixed with `spark.hadoop.`
      * - Otherwise, the key will be added a `spark.` prefix
      */
-    conf.getAll.foreach { case (k, v) =>
-      val newKey = if (k.startsWith("spark.")) {
-        k
-      } else if (k.startsWith("hadoop.")) {
-        "spark.hadoop." + k
-      } else {
-        "spark." + k
-      }
+    allConf.foreach { case (k, v) =>
+      val newKey =
+        if (k.startsWith("spark.")) {
+          k
+        } else if (k.startsWith("hadoop.")) {
+          "spark.hadoop." + k
+        } else {
+          "spark." + k
+        }
       buffer += CONF
       buffer += s"$newKey=$v"
     }
@@ -152,11 +99,6 @@ class SparkProcessBuilder(
     buffer.toArray
   }
 
-  override def toString: String = commands.map {
-    case arg if arg.startsWith("--") => s"\\\n\t$arg"
-    case arg => arg
-  }.mkString(" ")
-
   override protected def module: String = "kyuubi-spark-sql-engine"
 
   private def useKeytab(): Boolean = {
@@ -168,7 +110,13 @@ class SparkProcessBuilder(
       try {
         val ugi = UserGroupInformation
           .loginUserFromKeytabAndReturnUGI(principal.get, keytab.get)
-        ugi.getShortUserName == proxyUser
+        val keytabEnabled = ugi.getShortUserName == proxyUser
+        if (!keytabEnabled) {
+          warn(s"The session proxy user: $proxyUser is not same with " +
+            s"spark principal: ${ugi.getShortUserName}, so we can't support use keytab. " +
+            s"Fallback to use proxy user.")
+        }
+        keytabEnabled
       } catch {
         case e: IOException =>
           error(s"Failed to login for ${principal.get}", e)
@@ -176,17 +124,80 @@ class SparkProcessBuilder(
       }
     }
   }
+
+  private def zkAuthKeytabFileConf(sparkConf: Map[String, String]): Map[String, String] = {
+    val zkAuthKeytab = conf.get(HighAvailabilityConf.HA_ZK_AUTH_KEYTAB)
+    if (zkAuthKeytab.isDefined) {
+      sparkConf.get(SPARK_FILES) match {
+        case Some(files) =>
+          Map(SPARK_FILES -> s"$files,${zkAuthKeytab.get}")
+        case _ =>
+          Map(SPARK_FILES -> zkAuthKeytab.get)
+      }
+    } else {
+      Map()
+    }
+  }
+
+  override def shortName: String = "spark"
+
+  protected lazy val defaultMaster: Option[String] = {
+    val confDir = env.getOrElse(SPARK_CONF_DIR, s"$sparkHome${File.separator}conf")
+    val defaults =
+      try {
+        val confFile = new File(s"$confDir${File.separator}$SPARK_CONF_FILE_NAME")
+        if (confFile.exists()) {
+          Utils.getPropertiesFromFile(Some(confFile))
+        } else {
+          Map.empty[String, String]
+        }
+      } catch {
+        case _: Exception =>
+          warn(s"Failed to load spark configurations from $confDir")
+          Map.empty[String, String]
+      }
+    defaults.get(MASTER_KEY)
+  }
+
+  override def clusterManager(): Option[String] = {
+    conf.getOption(MASTER_KEY).orElse(defaultMaster)
+  }
 }
 
 object SparkProcessBuilder {
   final val APP_KEY = "spark.app.name"
   final val TAG_KEY = "spark.yarn.tags"
+  final val MASTER_KEY = "spark.master"
 
-  private final val CONF = "--conf"
-  private final val CLASS = "--class"
-  private final val PROXY_USER = "--proxy-user"
-  private final val PRINCIPAL = "spark.kerberos.principal"
-  private final val KEYTAB = "spark.kerberos.keytab"
+  /**
+   * The path configs from Spark project that might upload local files:
+   * - SparkSubmit
+   * - org.apache.spark.deploy.yarn.Client::prepareLocalResources
+   * - KerberosConfDriverFeatureStep::configurePod
+   * - KubernetesUtils.uploadAndTransformFileUris
+   */
+  final val PATH_CONFIGS = Seq(
+    SPARK_FILES,
+    "spark.jars",
+    "spark.archives",
+    "spark.yarn.jars",
+    "spark.yarn.dist.files",
+    "spark.yarn.dist.pyFiles",
+    "spark.yarn.dist.jars",
+    "spark.yarn.dist.archives",
+    "spark.kerberos.keytab",
+    "spark.yarn.keytab",
+    "spark.kubernetes.kerberos.krb5.path",
+    "spark.kubernetes.file.upload.path")
+
+  final private[spark] val CONF = "--conf"
+  final private[spark] val CLASS = "--class"
+  final private[spark] val PROXY_USER = "--proxy-user"
+  final private[spark] val SPARK_FILES = "spark.files"
+  final private[spark] val PRINCIPAL = "spark.kerberos.principal"
+  final private[spark] val KEYTAB = "spark.kerberos.keytab"
   // Get the appropriate spark-submit file
-  private final val SPARK_SUBMIT_FILE = if (Utils.isWindows) "spark-submit.cmd" else "spark-submit"
+  final private val SPARK_SUBMIT_FILE = if (Utils.isWindows) "spark-submit.cmd" else "spark-submit"
+  final private val SPARK_CONF_DIR = "SPARK_CONF_DIR"
+  final private val SPARK_CONF_FILE_NAME = "spark-defaults.conf"
 }

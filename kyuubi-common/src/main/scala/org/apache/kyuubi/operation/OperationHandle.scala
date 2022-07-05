@@ -17,67 +17,38 @@
 
 package org.apache.kyuubi.operation
 
-import java.util.Objects
+import java.util.UUID
 
-import scala.language.implicitConversions
+import org.apache.hive.service.rpc.thrift.TOperationHandle
 
-import org.apache.hive.service.rpc.thrift.{TOperationHandle, TProtocolVersion}
+import org.apache.kyuubi.cli.Handle
 
-import org.apache.kyuubi.cli.{Handle, HandleIdentifier}
-import org.apache.kyuubi.operation.OperationType.OperationType
-
-case class OperationHandle(
-    identifier: HandleIdentifier,
-    typ: OperationType,
-    protocol: TProtocolVersion) extends Handle {
+case class OperationHandle(identifier: UUID) {
 
   private var _hasResultSet: Boolean = _
 
   def setHasResultSet(hasResultSet: Boolean): Unit = _hasResultSet = hasResultSet
 
-  implicit def toTOperationHandle: TOperationHandle = {
+  def toTOperationHandle: TOperationHandle = {
     val tOperationHandle = new TOperationHandle
-    tOperationHandle.setOperationId(identifier.toTHandleIdentifier)
-    tOperationHandle.setOperationType(OperationType.toTOperationType(typ))
+    tOperationHandle.setOperationId(Handle.toTHandleIdentifier(identifier))
     tOperationHandle.setHasResultSet(_hasResultSet)
     tOperationHandle
   }
 
-  override def hashCode(): Int = {
-    (Objects.hashCode(identifier) + 31) * 31 + Objects.hashCode(typ)
-  }
+  override def toString: String = s"OperationHandle [$identifier]"
 
-  override def equals(obj: Any): Boolean = obj match {
-    case OperationHandle(id, typ, _) =>
-      Objects.equals(this.typ, typ) && Objects.equals(this.identifier, id)
-    case _ => false
-  }
-
-  override def toString: String = {
-    s"OperationHandle [type=$typ, identifier: $identifier]"
-  }
 }
 
 object OperationHandle {
-  def apply(operationType: OperationType, protocol: TProtocolVersion): OperationHandle = {
-    apply(HandleIdentifier(), operationType, protocol)
-  }
-
-  def apply(tOperationHandle: TOperationHandle, protocol: TProtocolVersion): OperationHandle = {
-    apply(HandleIdentifier(tOperationHandle.getOperationId),
-      OperationType.getOperationType(tOperationHandle.getOperationType),
-      protocol)
-  }
+  def apply(): OperationHandle = new OperationHandle(UUID.randomUUID())
 
   def apply(tOperationHandle: TOperationHandle): OperationHandle = {
-    apply(tOperationHandle, TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V1)
+    new OperationHandle(
+      Handle.fromTHandleIdentifier(tOperationHandle.getOperationId))
   }
 
-  implicit def toTOperationHandle(handle: OperationHandle): TOperationHandle = {
-    val tOperationHandle = new TOperationHandle
-    tOperationHandle.setOperationId(handle.identifier.toTHandleIdentifier)
-    tOperationHandle.setOperationType(OperationType.toTOperationType(handle.typ))
-    tOperationHandle.setHasResultSet(handle._hasResultSet)
-    tOperationHandle
+  def apply(operationHandleStr: String): OperationHandle = {
+    OperationHandle(UUID.fromString(operationHandleStr))
   }
 }

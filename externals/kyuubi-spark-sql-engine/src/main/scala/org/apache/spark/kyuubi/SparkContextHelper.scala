@@ -20,14 +20,16 @@ package org.apache.spark.kyuubi
 import org.apache.hadoop.security.Credentials
 import org.apache.spark.SparkContext
 import org.apache.spark.deploy.SparkHadoopUtil
-import org.apache.spark.scheduler.SchedulerBackend
+import org.apache.spark.scheduler.{SchedulerBackend, SparkListenerEvent}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.UpdateDelegationTokens
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
 import org.apache.spark.scheduler.local.LocalSchedulerBackend
+import org.apache.spark.status.ElementTrackingStore
+import org.apache.spark.ui.SparkUI
 
 import org.apache.kyuubi.Logging
-import org.apache.kyuubi.engine.spark.events.KyuubiSparkEvent
-import org.apache.kyuubi.events.EventLogger
+import org.apache.kyuubi.config.KyuubiReservedKeys.KYUUBI_STATEMENT_ID_KEY
+import org.apache.kyuubi.events.KyuubiEvent
 
 /**
  * A place to invoke non-public APIs of [[SparkContext]], anything to be added here need to
@@ -35,8 +37,19 @@ import org.apache.kyuubi.events.EventLogger
  */
 object SparkContextHelper extends Logging {
 
-  def createSparkHistoryLogger(sc: SparkContext): EventLogger[KyuubiSparkEvent] = {
-    new SparkHistoryEventLogger(sc)
+  def postEventToSparkListenerBus(event: KyuubiEvent, sc: SparkContext) {
+    event match {
+      case s: SparkListenerEvent => sc.listenerBus.post(s)
+      case _ => // ignore
+    }
+  }
+
+  def getKvStore(sc: SparkContext): ElementTrackingStore = {
+    sc.statusStore.store.asInstanceOf[ElementTrackingStore]
+  }
+
+  def getSparkUI(sc: SparkContext): Option[SparkUI] = {
+    sc.ui
   }
 
   def updateDelegationTokens(sc: SparkContext, creds: Credentials): Unit = {
@@ -52,14 +65,22 @@ object SparkContextHelper extends Logging {
     }
   }
 
-}
-
-/**
- * A [[EventLogger]] that logs everything to SparkHistory
- * @param sc SparkContext
- */
-private class SparkHistoryEventLogger(sc: SparkContext) extends EventLogger[KyuubiSparkEvent] {
-  override def logEvent(kyuubiEvent: KyuubiSparkEvent): Unit = {
-    sc.listenerBus.post(kyuubiEvent)
+  /**
+   * Get a local property set in this thread, or null if it is missing. See
+   * `org.apache.spark.SparkContext.setLocalProperty`.
+   */
+  private def getLocalProperty(sc: SparkContext, propertyKey: String): String = {
+    sc.getLocalProperty(propertyKey)
   }
+
+  /**
+   * Get `KYUUBI_STATEMENT_ID_KEY` set in this thread, or null if it is missing.
+   *
+   * @param sc an active SparkContext
+   * @return the current statementId or null
+   */
+  def getCurrentStatementId(sc: SparkContext): String = {
+    getLocalProperty(sc, KYUUBI_STATEMENT_ID_KEY)
+  }
+
 }

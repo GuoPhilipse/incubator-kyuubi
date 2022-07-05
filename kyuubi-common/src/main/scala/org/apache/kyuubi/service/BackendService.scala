@@ -32,7 +32,6 @@ import org.apache.kyuubi.session.{SessionHandle, SessionManager}
  * 4. Check [[OperationStatus]] <br/>
  * 5. Retrieve [[org.apache.kyuubi.operation.Operation]] results and metadata <br/>
  * 6. Cancel/Close [[org.apache.kyuubi.operation.Operation]] <br/>
- *
  */
 trait BackendService {
 
@@ -49,6 +48,7 @@ trait BackendService {
   def executeStatement(
       sessionHandle: SessionHandle,
       statement: String,
+      confOverlay: Map[String, String],
       runAsync: Boolean,
       queryTimeout: Long): OperationHandle
 
@@ -76,6 +76,20 @@ trait BackendService {
       catalogName: String,
       schemaName: String,
       functionName: String): OperationHandle
+  def getPrimaryKeys(
+      sessionHandle: SessionHandle,
+      catalogName: String,
+      schemaName: String,
+      tableName: String): OperationHandle
+  def getCrossReference(
+      sessionHandle: SessionHandle,
+      primaryCatalog: String,
+      primarySchema: String,
+      primaryTable: String,
+      foreignCatalog: String,
+      foreignSchema: String,
+      foreignTable: String): OperationHandle
+  def getQueryId(operationHandle: OperationHandle): String
 
   def getOperationStatus(operationHandle: OperationHandle): OperationStatus
   def cancelOperation(operationHandle: OperationHandle): Unit

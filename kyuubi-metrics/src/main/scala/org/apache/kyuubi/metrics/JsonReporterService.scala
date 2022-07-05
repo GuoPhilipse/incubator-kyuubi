@@ -30,6 +30,7 @@ import com.codahale.metrics.MetricRegistry
 import com.codahale.metrics.json.MetricsModule
 import com.fasterxml.jackson.databind.ObjectMapper
 
+import org.apache.kyuubi.Utils
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.metrics.MetricsConf._
 import org.apache.kyuubi.service.AbstractService
@@ -37,13 +38,13 @@ import org.apache.kyuubi.service.AbstractService
 class JsonReporterService(registry: MetricRegistry)
   extends AbstractService("JsonReporterService") {
   private val jsonMapper = new ObjectMapper().registerModule(
-    new MetricsModule(TimeUnit.MILLISECONDS, TimeUnit.MILLISECONDS, false))
+    new MetricsModule(TimeUnit.SECONDS, TimeUnit.MILLISECONDS, false))
   private val timer = new Timer(true)
   private var reportDir: Path = _
   private var reportPath: Path = _
 
   override def initialize(conf: KyuubiConf): Unit = synchronized {
-    reportDir = Paths.get(conf.get(METRICS_JSON_LOCATION)).toAbsolutePath
+    reportDir = Utils.getAbsolutePathFromWork(conf.get(METRICS_JSON_LOCATION))
     Files.createDirectories(reportDir)
     reportPath = Paths.get(reportDir.toString, "report.json").toAbsolutePath
     super.initialize(conf)
@@ -52,21 +53,25 @@ class JsonReporterService(registry: MetricRegistry)
   override def start(): Unit = synchronized {
     val interval = conf.get(METRICS_JSON_INTERVAL)
     var writer: BufferedWriter = null
-    timer.schedule(new TimerTask {
-      override def run(): Unit = try {
-        val json = jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsString(registry)
-        val tmpPath = Files.createTempFile(reportDir, "report", ".json").toAbsolutePath
-        writer = Files.newBufferedWriter(tmpPath, StandardCharsets.UTF_8)
-        writer.write(json)
-        writer.close()
-        Files.setPosixFilePermissions(tmpPath, PosixFilePermissions.fromString("rwxr--r--"))
-        Files.move(tmpPath, reportPath, StandardCopyOption.REPLACE_EXISTING)
-      } catch {
-        case NonFatal(e) => error("Error writing metrics to json file" + reportPath, e)
-      } finally {
-        if (writer != null) writer.close()
-      }
-    }, interval, interval)
+    timer.schedule(
+      new TimerTask {
+        override def run(): Unit =
+          try {
+            val json = jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsString(registry)
+            val tmpPath = Files.createTempFile(reportDir, "report", ".json").toAbsolutePath
+            writer = Files.newBufferedWriter(tmpPath, StandardCharsets.UTF_8)
+            writer.write(json)
+            writer.close()
+            Files.setPosixFilePermissions(tmpPath, PosixFilePermissions.fromString("rwxr--r--"))
+            Files.move(tmpPath, reportPath, StandardCopyOption.REPLACE_EXISTING)
+          } catch {
+            case NonFatal(e) => error("Error writing metrics to json file" + reportPath, e)
+          } finally {
+            if (writer != null) writer.close()
+          }
+      },
+      interval,
+      interval)
     super.start()
   }
 

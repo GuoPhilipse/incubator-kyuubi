@@ -20,24 +20,28 @@ package org.apache.kyuubi.engine.spark.operation
 import java.io.IOException
 import java.time.ZoneId
 
-import org.apache.commons.lang3.StringUtils
 import org.apache.hive.service.rpc.thrift.{TRowSet, TTableSchema}
+import org.apache.spark.kyuubi.SparkUtilsHelper.redact
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.types.StructType
 
 import org.apache.kyuubi.{KyuubiSQLException, Utils}
-import org.apache.kyuubi.engine.spark.FetchIterator
+import org.apache.kyuubi.config.KyuubiConf
+import org.apache.kyuubi.config.KyuubiReservedKeys.{KYUUBI_SESSION_USER_KEY, KYUUBI_STATEMENT_ID_KEY}
+import org.apache.kyuubi.engine.spark.KyuubiSparkUtil.SPARK_SCHEDULER_POOL_KEY
 import org.apache.kyuubi.engine.spark.operation.SparkOperation.TIMEZONE_KEY
-import org.apache.kyuubi.operation.{AbstractOperation, OperationState}
+import org.apache.kyuubi.engine.spark.schema.{RowSet, SchemaHelper}
+import org.apache.kyuubi.engine.spark.session.SparkSessionImpl
+import org.apache.kyuubi.operation.{AbstractOperation, FetchIterator, OperationState}
 import org.apache.kyuubi.operation.FetchOrientation._
 import org.apache.kyuubi.operation.OperationState.OperationState
-import org.apache.kyuubi.operation.OperationType.OperationType
 import org.apache.kyuubi.operation.log.OperationLog
-import org.apache.kyuubi.schema.{RowSet, SchemaHelper}
 import org.apache.kyuubi.session.Session
 
-abstract class SparkOperation(spark: SparkSession, opType: OperationType, session: Session)
-  extends AbstractOperation(opType, session) {
+abstract class SparkOperation(session: Session)
+  extends AbstractOperation(session) {
+
+  protected val spark: SparkSession = session.asInstanceOf[SparkSessionImpl].spark
 
   private val timeZone: ZoneId = {
     spark.conf.getOption(TIMEZONE_KEY).map { timeZoneId =>
@@ -51,7 +55,10 @@ abstract class SparkOperation(spark: SparkSession, opType: OperationType, sessio
 
   protected def resultSchema: StructType
 
-  protected def cleanup(targetState: OperationState): Unit = state.synchronized {
+  override def redactedStatement: String =
+    redact(spark.sessionState.conf.stringRedactionPattern, statement)
+
+  override def cleanup(targetState: OperationState): Unit = state.synchronized {
     if (!isTerminalState(state)) {
       setState(targetState)
       Option(getBackgroundHandle).foreach(_.cancel(true))
@@ -59,26 +66,31 @@ abstract class SparkOperation(spark: SparkSession, opType: OperationType, sessio
     }
   }
 
-  /**
-   * convert SQL 'like' pattern to a Java regular expression.
-   *
-   * Underscores (_) are converted to '.' and percent signs (%) are converted to '.*'.
-   *
-   * (referred to Spark's implementation: convertPattern function in file MetadataOperation.java)
-   *
-   * @param input the SQL pattern to convert
-   * @return the equivalent Java regular expression of the pattern
-   */
-  def toJavaRegex(input: String): String = {
-    val res = if (StringUtils.isEmpty(input) || input == "*") {
-      "%"
-    } else {
-      input
+  private val forceCancel =
+    session.sessionManager.getConf.get(KyuubiConf.OPERATION_FORCE_CANCEL)
+
+  private val schedulerPool =
+    spark.conf.getOption(KyuubiConf.OPERATION_SCHEDULER_POOL.key).orElse(
+      session.sessionManager.getConf.get(KyuubiConf.OPERATION_SCHEDULER_POOL))
+
+  protected def withLocalProperties[T](f: => T): T = {
+    try {
+      spark.sparkContext.setJobGroup(statementId, redactedStatement, forceCancel)
+      spark.sparkContext.setLocalProperty(KYUUBI_SESSION_USER_KEY, session.user)
+      spark.sparkContext.setLocalProperty(KYUUBI_STATEMENT_ID_KEY, statementId)
+      schedulerPool match {
+        case Some(pool) =>
+          spark.sparkContext.setLocalProperty(SPARK_SCHEDULER_POOL_KEY, pool)
+        case None =>
+      }
+
+      f
+    } finally {
+      spark.sparkContext.setLocalProperty(SPARK_SCHEDULER_POOL_KEY, null)
+      spark.sparkContext.setLocalProperty(KYUUBI_SESSION_USER_KEY, null)
+      spark.sparkContext.setLocalProperty(KYUUBI_STATEMENT_ID_KEY, null)
+      spark.sparkContext.clearJobGroup()
     }
-    val wStr = ".*"
-    res
-      .replaceAll("([^\\\\])%", "$1" + wStr).replaceAll("\\\\%", "%").replaceAll("^%", wStr)
-      .replaceAll("([^\\\\])_", "$1.").replaceAll("\\\\_", "_").replaceAll("^_", ".")
   }
 
   protected def onError(cancel: Boolean = false): PartialFunction[Throwable, Unit] = {
@@ -93,12 +105,13 @@ abstract class SparkOperation(spark: SparkSession, opType: OperationType, sessio
           setOperationException(ke)
           throw ke
         } else if (isTerminalState(state)) {
+          setOperationException(KyuubiSQLException(errMsg))
           warn(s"Ignore exception in terminal state with $statementId: $errMsg")
         } else {
-          setState(OperationState.ERROR)
           error(s"Error operating $opType: $errMsg", e)
           val ke = KyuubiSQLException(s"Error operating $opType: $errMsg", e)
           setOperationException(ke)
+          setState(OperationState.ERROR)
           throw ke
         }
       }
@@ -135,20 +148,26 @@ abstract class SparkOperation(spark: SparkSession, opType: OperationType, sessio
 
   override def getResultSetSchema: TTableSchema = SchemaHelper.toTTableSchema(resultSchema)
 
-  override def getNextRowSet(order: FetchOrientation, rowSetSize: Int): TRowSet = {
-    validateDefaultFetchOrientation(order)
-    assertState(OperationState.FINISHED)
-    setHasResultSet(true)
-    order match {
-      case FETCH_NEXT => iter.fetchNext()
-      case FETCH_PRIOR => iter.fetchPrior(rowSetSize);
-      case FETCH_FIRST => iter.fetchAbsolute(0);
+  override def getNextRowSet(order: FetchOrientation, rowSetSize: Int): TRowSet =
+    withLocalProperties {
+      var resultRowSet: TRowSet = null
+      try {
+        validateDefaultFetchOrientation(order)
+        assertState(OperationState.FINISHED)
+        setHasResultSet(true)
+        order match {
+          case FETCH_NEXT => iter.fetchNext()
+          case FETCH_PRIOR => iter.fetchPrior(rowSetSize);
+          case FETCH_FIRST => iter.fetchAbsolute(0);
+        }
+        val taken = iter.take(rowSetSize)
+        resultRowSet =
+          RowSet.toTRowSet(taken.toList, resultSchema, getProtocolVersion, timeZone)
+        resultRowSet.setStartRowOffset(iter.getPosition)
+      } catch onError(cancel = true)
+
+      resultRowSet
     }
-    val taken = iter.take(rowSetSize)
-    val resultRowSet = RowSet.toTRowSet(taken.toList, resultSchema, getProtocolVersion, timeZone)
-    resultRowSet.setStartRowOffset(iter.getPosition)
-    resultRowSet
-  }
 
   override def shouldRunAsync: Boolean = false
 }

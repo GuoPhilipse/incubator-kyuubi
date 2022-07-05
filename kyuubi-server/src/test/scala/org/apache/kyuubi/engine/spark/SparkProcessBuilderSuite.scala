@@ -20,17 +20,20 @@ package org.apache.kyuubi.engine.spark
 import java.io.File
 import java.nio.file.{Files, Path, Paths, StandardOpenOption}
 import java.time.Duration
+import java.util.UUID
 import java.util.concurrent.{Executors, TimeUnit}
 
 import org.scalatest.time.SpanSugar._
+import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.kyuubi.{KerberizedTestHelper, KyuubiSQLException, Utils}
 import org.apache.kyuubi.config.KyuubiConf
-import org.apache.kyuubi.config.KyuubiConf.ENGINE_LOG_TIMEOUT
-import org.apache.kyuubi.config.KyuubiConf.ENGINE_SPARK_MAIN_RESOURCE
+import org.apache.kyuubi.config.KyuubiConf.{ENGINE_LOG_TIMEOUT, ENGINE_SPARK_MAIN_RESOURCE}
+import org.apache.kyuubi.ha.HighAvailabilityConf
+import org.apache.kyuubi.ha.client.AuthTypes
 import org.apache.kyuubi.service.ServiceUtils
 
-class SparkProcessBuilderSuite extends KerberizedTestHelper {
+class SparkProcessBuilderSuite extends KerberizedTestHelper with MockitoSugar {
   private def conf = KyuubiConf().set("kyuubi.on", "off")
 
   test("spark process builder") {
@@ -59,8 +62,8 @@ class SparkProcessBuilderSuite extends KerberizedTestHelper {
       assert(error.isInstanceOf[KyuubiSQLException])
     }
 
-    val processBuilder1 = new SparkProcessBuilder("kentyao",
-      conf.set("spark.hive.metastore.uris", "thrift://dummy"))
+    val processBuilder1 =
+      new SparkProcessBuilder("kentyao", conf.set("spark.hive.metastore.uris", "thrift://dummy"))
 
     processBuilder1.start
     eventually(timeout(90.seconds), interval(500.milliseconds)) {
@@ -70,20 +73,18 @@ class SparkProcessBuilderSuite extends KerberizedTestHelper {
     }
   }
 
-
   test("engine log truncation") {
-    val msg = "org.apache.spark.sql.hive."
-    val pb = new SparkProcessBuilder("kentyao",
-      conf.set("spark.hive.metastore.uris", "thrift://dummy"))
+    val pb =
+      new SparkProcessBuilder("kentyao", conf.set("spark.hive.metastore.uris", "thrift://dummy"))
     pb.start
     eventually(timeout(90.seconds), interval(500.milliseconds)) {
       val error1 = pb.getError
       assert(!error1.getMessage.contains("Failed to detect the root cause"))
       assert(error1.getMessage.contains("See more: "))
-      assert(error1.getMessage.contains(msg))
     }
 
-    val pb2 = new SparkProcessBuilder("kentyao",
+    val pb2 = new SparkProcessBuilder(
+      "kentyao",
       conf.set("spark.hive.metastore.uris", "thrift://dummy")
         .set(KyuubiConf.ENGINE_ERROR_MAX_SIZE, 200))
     pb2.start
@@ -91,7 +92,16 @@ class SparkProcessBuilderSuite extends KerberizedTestHelper {
       val error1 = pb2.getError
       assert(!error1.getMessage.contains("Failed to detect the root cause"))
       assert(error1.getMessage.contains("See more: "))
-      assert(!error1.getMessage.contains(msg), "stack trace shall be truncated")
+    }
+
+    val pb3 =
+      new SparkProcessBuilder("kentyao", conf.set("spark.kerberos.principal", testPrincipal))
+    pb3.start
+    eventually(timeout(90.seconds), interval(500.milliseconds)) {
+      val error1 = pb3.getError
+      assert(!error1.getMessage.contains("Failed to detect the root cause"))
+      assert(error1.getMessage.contains("See more: "))
+      assert(error1.getMessage.contains("Only one of --proxy-user or --principal can be provided"))
     }
   }
 
@@ -226,26 +236,6 @@ class SparkProcessBuilderSuite extends KerberizedTestHelper {
     assert(b2.mainResource.getOrElse("") != jarPath.toString)
   }
 
-  test("kill application") {
-    val pb1 = new FakeSparkProcessBuilder(conf) {
-      override protected def env: Map[String, String] = Map()
-    }
-    val exit1 = pb1.killApplication("21/09/30 17:12:47 INFO yarn.Client: " +
-      "Application report for application_1593587619692_20149 (state: ACCEPTED)")
-    assert(exit1.contains("KYUUBI_HOME is not set!"))
-
-    val pb2 = new FakeSparkProcessBuilder(conf) {
-      override protected def env: Map[String, String] = Map("KYUUBI_HOME" -> "")
-    }
-    val exit2 = pb2.killApplication("21/09/30 17:12:47 INFO yarn.Client: " +
-      "Application report for application_1593587619692_20149 (state: ACCEPTED)")
-    assert(exit2.contains("application_1593587619692_20149")
-      && !exit2.contains("KYUUBI_HOME is not set!"))
-
-    val exit3 = pb2.killApplication("unknow")
-    assert(exit3.equals(""))
-  }
-
   test("add spark prefix for conf") {
     val conf = KyuubiConf(false)
     conf.set("kyuubi.kent", "yao")
@@ -259,9 +249,30 @@ class SparkProcessBuilderSuite extends KerberizedTestHelper {
     assert(commands.contains("spark.kent=yao"))
     assert(commands.contains("spark.hadoop.hadoop.kent=yao"))
   }
+
+  test("zookeeper kerberos authentication") {
+    val conf = KyuubiConf()
+    conf.set(HighAvailabilityConf.HA_ZK_AUTH_TYPE.key, AuthTypes.KERBEROS.toString)
+    conf.set(HighAvailabilityConf.HA_ZK_AUTH_KEYTAB.key, testKeytab)
+    conf.set(HighAvailabilityConf.HA_ZK_AUTH_PRINCIPAL.key, testPrincipal)
+
+    val b1 = new SparkProcessBuilder("test", conf)
+    assert(b1.toString.contains(s"--conf spark.files=$testKeytab"))
+  }
+
+  test("SparkProcessBuilder commands immutable") {
+    val conf = KyuubiConf(false)
+    val engineRefId = UUID.randomUUID().toString
+    val pb = new SparkProcessBuilder("", conf, engineRefId)
+    assert(pb.toString.contains(engineRefId))
+    val engineRefId2 = UUID.randomUUID().toString
+    conf.set("spark.yarn.tags", engineRefId2)
+    assert(!pb.toString.contains(engineRefId2))
+    assert(pb.toString.contains(engineRefId))
+  }
 }
 
 class FakeSparkProcessBuilder(config: KyuubiConf)
   extends SparkProcessBuilder("fake", config) {
-  override protected def commands: Array[String] = Array("ls")
+  override protected val commands: Array[String] = Array("ls")
 }

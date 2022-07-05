@@ -30,6 +30,12 @@ class CatalogShim_v2_4 extends SparkCatalogShim {
 
   override protected def catalogExists(spark: SparkSession, catalog: String): Boolean = false
 
+  override def setCurrentCatalog(spark: SparkSession, catalog: String): Unit = {}
+
+  override def getCurrentCatalog(spark: SparkSession): Row = {
+    Row(SparkCatalogShim.SESSION_CATALOG)
+  }
+
   override def getSchemas(
       spark: SparkSession,
       catalogName: String,
@@ -38,8 +44,17 @@ class CatalogShim_v2_4 extends SparkCatalogShim {
       getGlobalTempViewManager(spark, schemaPattern)).map(Row(_, ""))
   }
 
+  def setCurrentDatabase(spark: SparkSession, databaseName: String): Unit = {
+    spark.sessionState.catalog.setCurrentDatabase(databaseName)
+  }
+
+  def getCurrentDatabase(spark: SparkSession): Row = {
+    Row(spark.sessionState.catalog.getCurrentDatabase)
+  }
+
   override protected def getGlobalTempViewManager(
-      spark: SparkSession, schemaPattern: String): Seq[String] = {
+      spark: SparkSession,
+      schemaPattern: String): Seq[String] = {
     val database = spark.sharedState.globalTempViewManager.database
     Option(database).filter(_.matches(schemaPattern)).toSeq
   }
@@ -57,10 +72,19 @@ class CatalogShim_v2_4 extends SparkCatalogShim {
       val identifiers = catalog.listTables(db, tablePattern, includeLocalTempViews = false)
       catalog.getTablesByName(identifiers)
         .filter(t => matched(tableTypes, t.tableType.name)).map { t =>
-        val typ = if (t.tableType.name == "VIEW") "VIEW" else "TABLE"
-        Row(catalogName, t.database, t.identifier.table, typ, t.comment.getOrElse(""),
-          null, null, null, null, null)
-      }
+          val typ = if (t.tableType.name == "VIEW") "VIEW" else "TABLE"
+          Row(
+            catalogName,
+            t.database,
+            t.identifier.table,
+            typ,
+            t.comment.getOrElse(""),
+            null,
+            null,
+            null,
+            null,
+            null)
+        }
     }
   }
 
@@ -71,8 +95,7 @@ class CatalogShim_v2_4 extends SparkCatalogShim {
       tablePattern: String): Seq[Row] = {
     val views = getViews(spark, schemaPattern, tablePattern)
     views.map { ident =>
-      Row(catalogName, ident.database.orNull, ident.table, "VIEW", "",
-        null, null, null, null, null)
+      Row(catalogName, ident.database.orNull, ident.table, "VIEW", "", null, null, null, null, null)
     }
   }
 
@@ -116,7 +139,13 @@ class CatalogShim_v2_4 extends SparkCatalogShim {
     databases.flatMap { db =>
       val identifiers = catalog.listTables(db, tablePattern, includeLocalTempViews = true)
       catalog.getTablesByName(identifiers).flatMap { t =>
-        t.schema.zipWithIndex.filter(f => columnPattern.matcher(f._1.name).matches())
+        val tableSchema =
+          if (t.provider.getOrElse("").equalsIgnoreCase("delta")) {
+            spark.table(t.identifier.table).schema
+          } else {
+            t.schema
+          }
+        tableSchema.zipWithIndex.filter(f => columnPattern.matcher(f._1.name).matches())
           .map { case (f, i) => toColumnResult(catalogName, t.database, t.identifier.table, f, i) }
       }
     }
@@ -142,9 +171,9 @@ class CatalogShim_v2_4 extends SparkCatalogShim {
   }
 
   protected def getColumnsByLocalTempViews(
-    spark: SparkSession,
-    tablePattern: String,
-    columnPattern: Pattern): Seq[Row] = {
+      spark: SparkSession,
+      tablePattern: String,
+      columnPattern: Pattern): Seq[Row] = {
     val catalog = spark.sessionState.catalog
 
     catalog.listLocalTempViews(tablePattern)

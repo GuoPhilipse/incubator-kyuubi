@@ -39,9 +39,11 @@
 .idea_modules/
 .project
 .pydevproject
+.python-version
 .scala_dependencies
 .settings
 build/apache-maven*
+build/release/tmp
 build/scala*
 build/test
 target/
@@ -57,8 +59,7 @@ spark-warehouse/
 metastore_db
 derby.log
 ldap
-*/dependency-reduced-pom.xml
-*/*/dependency-reduced-pom.xml
+**/dependency-reduced-pom.xml
 metrics/report.json
 metrics/.report.json.crc
 /kyuubi-ha/embedded_zookeeper/
@@ -69,6 +70,10 @@ embedded_zookeeper/
 /work/
 /docs/_build/
 /kyuubi-common/metrics/
+/kyuubi-server/metrics/
 **/operation_logs/
 **/server_operation_logs/
 **/engine_operation_logs/
+conf/log4j2.xml
+conf/kyuubi-defaults.conf
+conf/kyuubi-env.sh

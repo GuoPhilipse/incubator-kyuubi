@@ -17,151 +17,89 @@
 
 package org.apache.kyuubi.tpcds
 
-import java.io.InputStream
-import java.lang.ProcessBuilder.Redirect
-import java.nio.file.{Files, Paths}
-import java.nio.file.attribute.PosixFilePermissions._
+import scala.collection.JavaConverters._
 
-import scala.io.Source
-
-import org.apache.spark.{KyuubiSparkUtils, SparkEnv}
+import io.trino.tpcds.{Options, Results}
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
-import org.slf4j.{Logger, LoggerFactory}
 
 case class TableGenerator(
     name: String,
     partitionCols: Seq[String],
     fields: StructField*) {
-  @transient private lazy val logger: Logger = LoggerFactory.getLogger(this.getClass.getSimpleName)
 
   private val schema: StructType = StructType(fields)
   private val rawSchema: StructType = StructType(fields.map(f => StructField(f.name, StringType)))
 
   private var scaleFactor: Int = 1
+  def setScaleFactor(scale: Int): Unit = this.scaleFactor = scale
 
-  private var parallelism: Int = scaleFactor * 2
+  private var _parallelism: Option[Int] = None
+  private def parallelism: Int = _parallelism.getOrElse(scaleFactor * 2)
+  def setParallelism(parallel: Int): Unit = this._parallelism = Some(parallel max 2)
 
   private val ss: SparkSession = SparkSession.active
-  private val format: String = ss.conf.get("spark.sql.sources.default", "parquet")
+  private var _format: Option[String] = None
+  private def format: String = _format.getOrElse(ss.conf.get("spark.sql.sources.default"))
+  def setFormat(format: String): Unit = this._format = Some(format)
 
-  private def radix: Int = {
-    math.min(math.max(5, scaleFactor / 100), parallelism)
-  }
+  private def radix: Int = (scaleFactor / 100) max 5 min parallelism
 
   private def toDF: DataFrame = {
-    val rawRDD = ss.sparkContext.parallelize(1 to parallelism, parallelism).flatMap { i =>
-      val os = System.getProperty("os.name").split(' ')(0).toLowerCase
-      val loader = Thread.currentThread().getContextClassLoader
+    val rowRDD = ss.sparkContext.parallelize(1 to parallelism, parallelism).flatMap { i =>
+      val opt = new Options
+      opt.table = name
+      opt.scale = scaleFactor
+      opt.parallelism = parallelism
 
-      val tempDir = KyuubiSparkUtils.createTempDir(SparkEnv.get.conf)
-      tempDir.toPath
-      val dsdgen = Paths.get(tempDir.toString, "dsdgen")
-      val idx = Paths.get(tempDir.toString, "tpcds.idx")
+      val session = opt.toSession.withChunkNumber(i)
+      val table = session.getOnlyTableToGenerate
 
-      Seq(dsdgen, idx).foreach { file =>
-        val in: InputStream = loader.getResourceAsStream(s"bin/$os/${file.toFile.getName}")
-        Files.createFile(file, asFileAttribute(fromString("rwx------")))
-        val outputStream = Files.newOutputStream(file)
-        try {
-          val buffer = new Array[Byte](8192)
-          var bytesRead = 0
-          val canRead = () => {
-            bytesRead = in.read(buffer)
-            bytesRead != -1
-          }
-          while (canRead()) {
-            outputStream.write(buffer, 0, bytesRead)
-          }
-        } finally {
-          outputStream.flush()
-          outputStream.close()
-          in.close()
-        }
-      }
-
-      val cmd = s"./dsdgen" +
-        s" -TABLE $name" +
-        s" -SCALE $scaleFactor" +
-        s" -PARALLEL $parallelism" +
-        s" -child $i" +
-        s" -DISTRIBUTIONS tpcds.idx" +
-        s" -FORCE Y" +
-        s" -QUIET Y"
-
-      val builder = new ProcessBuilder(cmd.split(" "): _*)
-      builder.directory(tempDir)
-      builder.redirectError(Redirect.INHERIT)
-      logger.info(s"Start $cmd at ${builder.directory()}")
-      val process = builder.start()
-      val res = process.waitFor()
-
-      logger.info(s"Finish w/ $res $cmd")
-      val data = Paths.get(tempDir.toString, s"${name}_${i}_$parallelism.dat")
-      val iterator = if (Files.exists(data)) {
-        // ... realized that when opening the dat files I should use the “Cp1252” encoding.
-        // https://github.com/databricks/spark-sql-perf/pull/104
-        // noinspection SourceNotClosed
-        Source.fromFile(data.toFile, "cp1252", 8192).getLines
-      } else {
-        logger.warn(s"No data generated in child $i")
-        Nil
-      }
-      iterator
-    }
-
-    val rowRDD = rawRDD.mapPartitions { iter =>
-      iter.map { line =>
-        val v = line.split("\\|", -1).dropRight(1).map(Option(_).filter(_.nonEmpty).orNull)
-        Row.fromSeq(v)
-      }
+      Results.constructResults(table, session).iterator.asScala
+        .map { _.get(0).asScala } // 1st row is specific table row
+        .map { row => row.map { v => if (v == Options.DEFAULT_NULL_STRING) null else v } }
+        .map { row => Row.fromSeq(row) }
     }
 
     val columns = fields.map { f => col(f.name).cast(f.dataType).as(f.name) }
     ss.createDataFrame(rowRDD, rawSchema).select(columns: _*)
   }
 
-  def setScaleFactor(scale: Int): Unit = {
-    this.scaleFactor = scale
-  }
-
-  def setParallelism(parallel: Int): Unit = {
-    this.parallelism = math.max(2, parallel)
-  }
-
   def create(): Unit = {
-    val data = if (partitionCols.isEmpty) {
-      toDF.repartition(radix)
-    } else {
-      toDF.persist()
-    }
+    val data =
+      if (partitionCols.isEmpty) {
+        toDF.repartition(radix)
+      } else {
+        toDF.persist()
+      }
 
     val tempViewName = s"${name}_view"
 
     data.createOrReplaceTempView(tempViewName)
 
-    val writer = if (partitionCols.nonEmpty) {
-      val query =
-        s"""
-           |(SELECT
-           | ${fields.map(_.name).mkString(", ")}
-           |FROM
-           | $tempViewName WHERE ${partitionCols.head} IS NOT NULL
-           |DISTRIBUTE BY ${partitionCols.head})
-           |UNION ALL
-           |(SELECT
-           | ${fields.map(_.name).mkString(", ")}
-           |FROM
-           | $tempViewName
-           |WHERE ${partitionCols.head} IS NULL
-           |DISTRIBUTE BY CAST(RAND() * $radix AS INT))
-           |""".stripMargin
+    val writer =
+      if (partitionCols.nonEmpty) {
+        val query =
+          s"""
+             |(SELECT
+             | ${fields.map(_.name).mkString(", ")}
+             |FROM
+             | $tempViewName WHERE ${partitionCols.head} IS NOT NULL
+             |DISTRIBUTE BY ${partitionCols.head})
+             |UNION ALL
+             |(SELECT
+             | ${fields.map(_.name).mkString(", ")}
+             |FROM
+             | $tempViewName
+             |WHERE ${partitionCols.head} IS NULL
+             |DISTRIBUTE BY CAST(RAND() * $radix AS INT))
+             |""".stripMargin
 
-      ss.sql(query).write.partitionBy(partitionCols: _*)
-    } else {
-      data.write
-    }
+        ss.sql(query).write.partitionBy(partitionCols: _*)
+      } else {
+        data.write
+      }
     ss.sql(s"DROP TABLE IF EXISTS $name")
     writer.format(format).saveAsTable(name)
     data.unpersist()

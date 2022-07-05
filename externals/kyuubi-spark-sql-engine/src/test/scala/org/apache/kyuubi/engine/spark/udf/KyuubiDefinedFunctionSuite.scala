@@ -21,7 +21,7 @@ import java.nio.file.Paths
 
 import scala.collection.mutable.ArrayBuffer
 
-import org.apache.kyuubi.{KyuubiFunSuite, TestUtils}
+import org.apache.kyuubi.{KyuubiFunSuite, TestUtils, Utils}
 
 // scalastyle:off line.size.limit
 /**
@@ -30,19 +30,19 @@ import org.apache.kyuubi.{KyuubiFunSuite, TestUtils}
  *
  * To run the entire test suite:
  * {{{
- *   build/mvn test -DwildcardSuites=org.apache.kyuubi.engine.spark.udf.KyuubiDefinedFunctionSuite -pl '!externals/kyuubi-download'
+ *   build/mvn clean install -Pflink-provided,spark-provided,hive-provided -DwildcardSuites=org.apache.kyuubi.engine.spark.udf.KyuubiDefinedFunctionSuite
  * }}}
  *
  * To re-generate golden files for entire suite, run:
  * {{{
- *   KYUUBI_UPDATE=1 build/mvn test -DwildcardSuites=org.apache.kyuubi.engine.spark.udf.KyuubiDefinedFunctionSuite -pl '!externals/kyuubi-download'
+ *   KYUUBI_UPDATE=1 build/mvn clean install -Pflink-provided,spark-provided,hive-provided -DwildcardSuites=org.apache.kyuubi.engine.spark.udf.KyuubiDefinedFunctionSuite
  * }}}
  */
 // scalastyle:on line.size.limit
 class KyuubiDefinedFunctionSuite extends KyuubiFunSuite {
 
-  private val kyuubiHome: String = getClass.getProtectionDomain.getCodeSource
-    .getLocation.getPath.split("kyuubi-spark-sql-engine")(0)
+  private val kyuubiHome: String = Utils.getCodeSourceLocation(getClass)
+    .split("kyuubi-spark-sql-engine")(0)
   private val markdown = Paths.get(kyuubiHome, "..", "docs", "sql", "functions.md")
     .toAbsolutePath
 

@@ -13,19 +13,15 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 
-.. image:: ../imgs/kyuubi_logo.png
-   :align: center
 
 Community
 =========
 
 .. toctree::
     :maxdepth: 2
-    :numbered: 4
     :glob:
 
+    CONTRIBUTING
     collaborators
-    contributions
-    improvement-proposals
     release
-    badges
+

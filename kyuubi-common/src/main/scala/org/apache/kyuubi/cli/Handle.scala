@@ -17,9 +17,28 @@
 
 package org.apache.kyuubi.cli
 
-import org.apache.hive.service.rpc.thrift.TProtocolVersion
+import java.nio.ByteBuffer
+import java.util.UUID
 
-trait Handle {
-  def identifier: HandleIdentifier
-  def protocol: TProtocolVersion
+import org.apache.hive.service.rpc.thrift.THandleIdentifier
+
+private[kyuubi] object Handle {
+  final private val SECRET_ID = UUID.fromString("c2ee5b97-3ea0-41fc-ac16-9bd708ed8f38")
+
+  def toTHandleIdentifier(publicId: UUID): THandleIdentifier = {
+    val guid = new Array[Byte](16)
+    val pbb = ByteBuffer.wrap(guid)
+    val secret = new Array[Byte](16)
+    val sbb = ByteBuffer.wrap(secret)
+    pbb.putLong(publicId.getMostSignificantBits)
+    pbb.putLong(publicId.getLeastSignificantBits)
+    sbb.putLong(SECRET_ID.getMostSignificantBits)
+    sbb.putLong(SECRET_ID.getLeastSignificantBits)
+    new THandleIdentifier(ByteBuffer.wrap(guid), ByteBuffer.wrap(secret))
+  }
+
+  def fromTHandleIdentifier(tHandleId: THandleIdentifier): UUID = {
+    val pbb = ByteBuffer.wrap(tHandleId.getGuid)
+    new UUID(pbb.getLong, pbb.getLong)
+  }
 }

@@ -17,13 +17,13 @@
 
 package org.apache.kyuubi.engine.spark.operation
 
-import org.apache.spark.sql.{Row, SparkSession}
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
 
-import org.apache.kyuubi.config.KyuubiConf.OperationModes.{ANALYZE, OperationMode, OPTIMIZE, PARSE}
-import org.apache.kyuubi.engine.spark.{ArrayFetchIterator, IterableFetchIterator}
-import org.apache.kyuubi.operation.OperationType
+import org.apache.kyuubi.config.KyuubiConf.OPERATION_PLAN_ONLY_EXCLUDES
+import org.apache.kyuubi.config.KyuubiConf.OperationModes._
+import org.apache.kyuubi.operation.{ArrayFetchIterator, IterableFetchIterator}
 import org.apache.kyuubi.operation.log.OperationLog
 import org.apache.kyuubi.session.Session
 
@@ -31,45 +31,53 @@ import org.apache.kyuubi.session.Session
  * Perform the statement parsing, analyzing or optimizing only without executing it
  */
 class PlanOnlyStatement(
-    spark: SparkSession,
     session: Session,
-    protected override val statement: String,
+    override val statement: String,
     mode: OperationMode)
-  extends SparkOperation(spark, OperationType.EXECUTE_STATEMENT, session) {
+  extends SparkOperation(session) {
 
   private val operationLog: OperationLog = OperationLog.createOperationLog(session, getHandle)
+  private val planExcludes: Seq[String] = {
+    spark.conf.getOption(OPERATION_PLAN_ONLY_EXCLUDES.key).map(_.split(",").map(_.trim).toSeq)
+      .getOrElse(session.sessionManager.getConf.get(OPERATION_PLAN_ONLY_EXCLUDES))
+  }
   override def getOperationLog: Option[OperationLog] = Option(operationLog)
 
-  override protected def resultSchema: StructType = if (result == null) {
-    new StructType().add("plan", "string")
-  } else {
-    result.schema
+  override protected def resultSchema: StructType = {
+    if (result == null) {
+      new StructType().add("plan", "string")
+    } else if (result.isEmpty) {
+      new StructType().add("result", "string")
+    } else result.schema
   }
 
-  private def isSetOrReset(plan: LogicalPlan): Boolean = {
-    val className = plan.getClass.getSimpleName
-    className == "SetCommand" || className == "ResetCommand"
-  }
-
-  override protected def runInternal(): Unit = {
+  override protected def runInternal(): Unit = withLocalProperties {
     try {
-      val parsed = spark.sessionState.sqlParser.parsePlan(statement)
-      parsed match {
-        case cmd if isSetOrReset(cmd) =>
-          result = spark.sql(statement)
-          iter = new ArrayFetchIterator(result.collect())
-        case otherPlan => mode match {
-          case PARSE =>
-            iter = new IterableFetchIterator(Seq(Row(otherPlan.toString())))
-          case ANALYZE =>
-            val analyzed = spark.sessionState.analyzer.execute(otherPlan)
-            spark.sessionState.analyzer.checkAnalysis(analyzed)
-            iter = new IterableFetchIterator(Seq(Row(analyzed.toString())))
-          case OPTIMIZE =>
-            val analyzed = spark.sessionState.analyzer.execute(otherPlan)
-            spark.sessionState.analyzer.checkAnalysis(analyzed)
-            val optimized = spark.sessionState.optimizer.execute(analyzed)
-            iter = new IterableFetchIterator(Seq(Row(optimized.toString())))
+      SQLConf.withExistingConf(spark.sessionState.conf) {
+        val parsed = spark.sessionState.sqlParser.parsePlan(statement)
+        parsed match {
+          case cmd if planExcludes.contains(cmd.getClass.getSimpleName) =>
+            result = spark.sql(statement)
+            iter = new ArrayFetchIterator(result.collect())
+          case plan => mode match {
+              case PARSE =>
+                iter = new IterableFetchIterator(Seq(Row(plan.toString())))
+              case ANALYZE =>
+                val analyzed = spark.sessionState.analyzer.execute(plan)
+                spark.sessionState.analyzer.checkAnalysis(analyzed)
+                iter = new IterableFetchIterator(Seq(Row(analyzed.toString())))
+              case OPTIMIZE =>
+                val analyzed = spark.sessionState.analyzer.execute(plan)
+                spark.sessionState.analyzer.checkAnalysis(analyzed)
+                val optimized = spark.sessionState.optimizer.execute(analyzed)
+                iter = new IterableFetchIterator(Seq(Row(optimized.toString())))
+              case PHYSICAL =>
+                val physical = spark.sql(statement).queryExecution.sparkPlan
+                iter = new IterableFetchIterator(Seq(Row(physical.toString())))
+              case EXECUTION =>
+                val executed = spark.sql(statement).queryExecution.executedPlan
+                iter = new IterableFetchIterator(Seq(Row(executed.toString())))
+            }
         }
       }
     } catch {

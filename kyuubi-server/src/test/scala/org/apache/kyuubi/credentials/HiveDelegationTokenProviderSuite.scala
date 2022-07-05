@@ -31,7 +31,7 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars._
 import org.apache.hadoop.hive.metastore.{HiveMetaException, HiveMetaStore}
-import org.apache.hadoop.hive.thrift.{DelegationTokenIdentifier, HadoopThriftAuthBridge, HadoopThriftAuthBridge23}
+import org.apache.hadoop.hive.metastore.security.{DelegationTokenIdentifier, HadoopThriftAuthBridge, HadoopThriftAuthBridge23}
 import org.apache.hadoop.io.Text
 import org.apache.hadoop.security.{Credentials, UserGroupInformation}
 import org.apache.hadoop.security.authorize.ProxyUsers
@@ -83,6 +83,9 @@ class HiveDelegationTokenProviderSuite extends KerberizedTestHelper {
       hiveConf.setVar(METASTORE_USE_THRIFT_SASL, "true")
       hiveConf.setVar(METASTORE_KERBEROS_PRINCIPAL, testPrincipal)
       hiveConf.setVar(METASTORE_KERBEROS_KEYTAB_FILE, testKeytab)
+      hiveConf.setVar(METASTORE_CONNECTION_POOLING_TYPE, "NONE")
+      hiveConf.setVar(METASTORE_AUTO_CREATE_ALL, "true")
+      hiveConf.setVar(METASTORE_SCHEMA_VERIFICATION, "false")
       ProxyUsers.refreshSuperUserGroupsConfiguration(hiveConf)
       val metaServer = new LocalMetaServer(hiveConf, classloader)
       metaServer.start()
@@ -126,7 +129,7 @@ class HiveDelegationTokenProviderSuite extends KerberizedTestHelper {
 class LocalMetaServer(
     hiveConf: HiveConf = defaultHiveConf(),
     serverContextClassLoader: ClassLoader)
-    extends Logging {
+  extends Logging {
   import LocalMetaServer._
 
   def start(): Unit = {
@@ -179,16 +182,17 @@ object LocalMetaServer {
 }
 
 class HadoopThriftAuthBridgeWithServerContextClassLoader(classloader: ClassLoader)
-    extends HadoopThriftAuthBridge23 {
+  extends HadoopThriftAuthBridge23 {
 
   override def createServer(
       keytabFile: String,
-      principalConf: String): HadoopThriftAuthBridge.Server = {
-    new Server(keytabFile, principalConf)
+      principalConf: String,
+      clientConf: String): HadoopThriftAuthBridge.Server = {
+    new Server(keytabFile, principalConf, clientConf)
   }
 
-  class Server(keytabFile: String, principalConf: String)
-      extends HadoopThriftAuthBridge.Server(keytabFile, principalConf) {
+  class Server(keytabFile: String, principalConf: String, clientConf: String)
+    extends HadoopThriftAuthBridge.Server(keytabFile, principalConf, clientConf) {
 
     override def wrapProcessor(processor: TProcessor): TProcessor = {
       new SetThreadContextClassLoaderProcess(super.wrapProcessor(processor))

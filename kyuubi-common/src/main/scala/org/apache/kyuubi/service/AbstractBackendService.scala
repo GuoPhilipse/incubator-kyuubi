@@ -56,9 +56,14 @@ abstract class AbstractBackendService(name: String)
   override def executeStatement(
       sessionHandle: SessionHandle,
       statement: String,
+      confOverlay: Map[String, String],
       runAsync: Boolean,
       queryTimeout: Long): OperationHandle = {
-    sessionManager.getSession(sessionHandle).executeStatement(statement, runAsync, queryTimeout)
+    sessionManager.getSession(sessionHandle).executeStatement(
+      statement,
+      confOverlay,
+      runAsync,
+      queryTimeout)
   }
 
   override def getTypeInfo(sessionHandle: SessionHandle): OperationHandle = {
@@ -114,6 +119,41 @@ abstract class AbstractBackendService(name: String)
     sessionManager
       .getSession(sessionHandle)
       .getFunctions(catalogName, schemaName, functionName)
+  }
+
+  override def getPrimaryKeys(
+      sessionHandle: SessionHandle,
+      catalogName: String,
+      schemaName: String,
+      tableName: String): OperationHandle = {
+    sessionManager
+      .getSession(sessionHandle)
+      .getPrimaryKeys(catalogName, schemaName, tableName)
+  }
+
+  override def getCrossReference(
+      sessionHandle: SessionHandle,
+      primaryCatalog: String,
+      primarySchema: String,
+      primaryTable: String,
+      foreignCatalog: String,
+      foreignSchema: String,
+      foreignTable: String): OperationHandle = {
+    sessionManager
+      .getSession(sessionHandle)
+      .getCrossReference(
+        primaryCatalog,
+        primarySchema,
+        primaryTable,
+        foreignCatalog,
+        foreignSchema,
+        foreignTable)
+  }
+
+  override def getQueryId(operationHandle: OperationHandle): String = {
+    val operation = sessionManager.operationManager.getOperation(operationHandle)
+    val queryId = sessionManager.operationManager.getQueryId(operation)
+    queryId
   }
 
   override def getOperationStatus(operationHandle: OperationHandle): OperationStatus = {

@@ -17,7 +17,6 @@
 
 package org.apache.kyuubi.server
 
-
 import java.io.{File, FileWriter}
 import java.net.InetAddress
 
@@ -27,25 +26,20 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.security.UserGroupInformation
 import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.apache.hadoop.yarn.server.MiniYARNCluster
-import org.scalatest.concurrent.Eventually._
-import org.scalatest.time.SpanSugar._
 
 import org.apache.kyuubi.Utils
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.service.AbstractService
 
-class MiniYarnService(name: String) extends AbstractService(name) {
-  def this() = this(classOf[MiniYarnService].getSimpleName)
+class MiniYarnService extends AbstractService("TestMiniYarnService") {
 
-  private var hadoopConfDir: File = _
-  private var yarnConf: YarnConfiguration = _
-  private var yarnCluster: MiniYARNCluster = _
-
-  private def newYarnConfig(): YarnConfiguration = {
+  private val hadoopConfDir: File = Utils.createTempDir().toFile
+  private val yarnConf: YarnConfiguration = {
     val yarnConfig = new YarnConfiguration()
     // Disable the disk utilization check to avoid the test hanging when people's disks are
     // getting full.
-    yarnConfig.set("yarn.nodemanager.disk-health-checker.max-disk-utilization-per-disk-percentage",
+    yarnConfig.set(
+      "yarn.nodemanager.disk-health-checker.max-disk-utilization-per-disk-percentage",
       "100.0")
 
     // capacity-scheduler.xml is missing in hadoop-client-minicluster so this is a workaround
@@ -75,29 +69,21 @@ class MiniYarnService(name: String) extends AbstractService(name) {
     yarnConfig.set(s"hadoop.proxyuser.$currentUser.hosts", "*")
     yarnConfig
   }
+  private val yarnCluster: MiniYARNCluster = new MiniYARNCluster(getName, 1, 1, 1)
 
   override def initialize(conf: KyuubiConf): Unit = {
-    hadoopConfDir = Utils.createTempDir().toFile
-    yarnConf = newYarnConfig()
-    yarnCluster = new MiniYARNCluster(name, 1, 1, 1)
     yarnCluster.init(yarnConf)
     super.initialize(conf)
   }
 
   override def start(): Unit = {
     yarnCluster.start()
-    val config = yarnCluster.getConfig
-    eventually(timeout(10.seconds), interval(100.milliseconds)) {
-      config.get(YarnConfiguration.RM_ADDRESS).split(":")(1) != "0"
-    }
-    info(s"RM address in configuration is ${config.get(YarnConfiguration.RM_ADDRESS)}")
     saveHadoopConf()
     super.start()
   }
 
   override def stop(): Unit = {
     if (yarnCluster != null) yarnCluster.stop()
-    if (hadoopConfDir != null) hadoopConfDir.delete()
     super.stop()
   }
 
@@ -105,7 +91,10 @@ class MiniYarnService(name: String) extends AbstractService(name) {
     val configToWrite = new Configuration(false)
     val hostName = InetAddress.getLocalHost.getHostName
     yarnCluster.getConfig.iterator().asScala.foreach { kv =>
-      configToWrite.set(kv.getKey, kv.getValue.replaceAll(hostName, "localhost"))
+      val key = kv.getKey
+      val value = kv.getValue.replaceAll(hostName, "localhost")
+      configToWrite.set(key, value)
+      getConf.set(key, value)
     }
     val writer = new FileWriter(new File(hadoopConfDir, "yarn-site.xml"))
     configToWrite.writeXml(writer)

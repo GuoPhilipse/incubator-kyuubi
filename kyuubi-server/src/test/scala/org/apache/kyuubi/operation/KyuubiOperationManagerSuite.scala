@@ -21,9 +21,9 @@ import java.sql.SQLTimeoutException
 
 import org.apache.kyuubi.WithKyuubiServer
 import org.apache.kyuubi.config.KyuubiConf
-import org.apache.kyuubi.config.KyuubiConf.OPERATION_QUERY_TIMEOUT
+import org.apache.kyuubi.config.KyuubiConf._
 
-class KyuubiOperationManagerSuite extends WithKyuubiServer with JDBCTestUtils {
+class KyuubiOperationManagerSuite extends WithKyuubiServer with HiveJDBCTestHelper {
   override protected val conf: KyuubiConf = {
     KyuubiConf().set(OPERATION_QUERY_TIMEOUT.key, "PT1S")
   }
@@ -48,7 +48,6 @@ class KyuubiOperationManagerSuite extends WithKyuubiServer with JDBCTestUtils {
     intercept[IllegalArgumentException] { mgr4.initialize(conf4) }
   }
 
-
   test("query time out shall respect server-side first") {
     withJdbcStatement() { statement =>
       Range(-1, 20, 5).foreach { clientTimeout =>
@@ -57,6 +56,36 @@ class KyuubiOperationManagerSuite extends WithKyuubiServer with JDBCTestUtils {
           statement.executeQuery("select java_method('java.lang.Thread', 'sleep', 10000L)")
         }.getMessage
         assert(e.contains("Query timed out after"))
+      }
+    }
+  }
+
+  test("set/get current catalog") {
+    withSessionConf()(
+      Map(ENGINE_OPERATION_CONVERT_CATALOG_DATABASE_ENABLED.key -> "true"))(
+      Map.empty) {
+      withJdbcStatement() { statement =>
+        val catalog = statement.getConnection.getCatalog
+        assert(catalog == "spark_catalog")
+        // The server starts the spark engine without other catalogs
+        statement.getConnection.setCatalog("dummy_catalog")
+        val changedCatalog = statement.getConnection.getCatalog
+        assert(changedCatalog == "spark_catalog")
+      }
+    }
+  }
+
+  test("set/get current database") {
+    withSessionConf()(
+      Map(ENGINE_OPERATION_CONVERT_CATALOG_DATABASE_ENABLED.key -> "true"))(
+      Map.empty) {
+      withDatabases("test_database") { statement =>
+        statement.execute("create database test_database")
+        val schema = statement.getConnection.getSchema
+        assert(schema == "default")
+        statement.getConnection.setSchema("test_database")
+        val changedSchema = statement.getConnection.getSchema
+        assert(changedSchema == "test_database")
       }
     }
   }

@@ -17,36 +17,63 @@
 
 package org.apache.kyuubi.operation
 
-import java.util.concurrent.Future
+import java.util.concurrent.{Future, ScheduledExecutorService, TimeUnit}
 
-import org.apache.hive.service.rpc.thrift.{TProtocolVersion, TRowSet, TTableSchema}
+import org.apache.commons.lang3.StringUtils
+import org.apache.hive.service.rpc.thrift.{TProgressUpdateResp, TProtocolVersion, TRowSet, TTableSchema}
 
 import org.apache.kyuubi.{KyuubiSQLException, Logging}
 import org.apache.kyuubi.config.KyuubiConf.OPERATION_IDLE_TIMEOUT
 import org.apache.kyuubi.operation.FetchOrientation.FetchOrientation
 import org.apache.kyuubi.operation.OperationState._
-import org.apache.kyuubi.operation.OperationType.OperationType
 import org.apache.kyuubi.operation.log.OperationLog
 import org.apache.kyuubi.session.Session
+import org.apache.kyuubi.util.ThreadUtils
 
-abstract class AbstractOperation(opType: OperationType, session: Session)
-  extends Operation with Logging {
+abstract class AbstractOperation(session: Session) extends Operation with Logging {
 
-  private final val handle = OperationHandle(opType, session.protocol)
-  private final val operationTimeout: Long = {
+  final protected val opType: String = getClass.getSimpleName
+  final protected val createTime = System.currentTimeMillis()
+  final private val handle = OperationHandle()
+  final private val operationTimeout: Long = {
     session.sessionManager.getConf.get(OPERATION_IDLE_TIMEOUT)
   }
 
-  protected final val statementId = handle.identifier.toString
+  final private[kyuubi] val statementId = handle.identifier.toString
+
+  private var statementTimeoutCleaner: Option[ScheduledExecutorService] = None
+
+  protected def cleanup(targetState: OperationState): Unit = state.synchronized {
+    if (!isTerminalState(state)) {
+      setState(targetState)
+      Option(getBackgroundHandle).foreach(_.cancel(true))
+    }
+  }
+
+  protected def addTimeoutMonitor(queryTimeout: Long): Unit = {
+    if (queryTimeout > 0) {
+      val timeoutExecutor =
+        ThreadUtils.newDaemonSingleThreadScheduledExecutor("query-timeout-thread", false)
+      val action: Runnable = () => cleanup(OperationState.TIMEOUT)
+      timeoutExecutor.schedule(action, queryTimeout, TimeUnit.SECONDS)
+      statementTimeoutCleaner = Some(timeoutExecutor)
+    }
+  }
+
+  protected def shutdownTimeoutMonitor(): Unit = {
+    statementTimeoutCleaner.foreach(_.shutdown())
+  }
 
   override def getOperationLog: Option[OperationLog] = None
 
   @volatile protected var state: OperationState = INITIALIZED
   @volatile protected var startTime: Long = _
   @volatile protected var completedTime: Long = _
-  @volatile protected var lastAccessTime: Long = System.currentTimeMillis()
+  @volatile protected var lastAccessTime: Long = createTime
 
   @volatile protected var operationException: KyuubiSQLException = _
+  @volatile protected var operationJobProgress: TProgressUpdateResp = _
+
   @volatile protected var hasResultSet: Boolean = false
 
   @volatile private var _backgroundHandle: Future[_] = _
@@ -57,7 +84,9 @@ abstract class AbstractOperation(opType: OperationType, session: Session)
 
   def getBackgroundHandle: Future[_] = _backgroundHandle
 
-  protected def statement: String = opType.toString
+  def statement: String = opType
+
+  def redactedStatement: String = statement
 
   protected def setHasResultSet(hasResultSet: Boolean): Unit = {
     this.hasResultSet = hasResultSet
@@ -66,6 +95,10 @@ abstract class AbstractOperation(opType: OperationType, session: Session)
 
   protected def setOperationException(opEx: KyuubiSQLException): Unit = {
     this.operationException = opEx
+  }
+
+  def setOperationJobProgress(opJobProgress: TProgressUpdateResp): Unit = {
+    this.operationJobProgress = opJobProgress
   }
 
   protected def setState(newState: OperationState): Unit = {
@@ -79,7 +112,7 @@ abstract class AbstractOperation(opType: OperationType, session: Session)
       case _ =>
     }
     info(s"Processing ${session.user}'s query[$statementId]: ${state.name} -> ${newState.name}," +
-      s" statement: $statement$timeCost")
+      s" statement: $redactedStatement$timeCost")
     state = newState
     lastAccessTime = System.currentTimeMillis()
   }
@@ -136,18 +169,50 @@ abstract class AbstractOperation(opType: OperationType, session: Session)
 
   override def close(): Unit
 
-  override def getProtocolVersion: TProtocolVersion = handle.protocol
+  protected def getProtocolVersion: TProtocolVersion = session.protocol
 
   override def getResultSetSchema: TTableSchema
 
   override def getNextRowSet(order: FetchOrientation, rowSetSize: Int): TRowSet
+
+  /**
+   * convert SQL 'like' pattern to a Java regular expression.
+   *
+   * Underscores (_) are converted to '.' and percent signs (%) are converted to '.*'.
+   *
+   * (referred to Spark's implementation: convertPattern function in file MetadataOperation.java)
+   *
+   * @param input the SQL pattern to convert
+   * @return the equivalent Java regular expression of the pattern
+   */
+  protected def toJavaRegex(input: String): String = {
+    val res =
+      if (StringUtils.isEmpty(input) || input == "*") {
+        "%"
+      } else {
+        input
+      }
+    val wStr = ".*"
+    res
+      .replaceAll("([^\\\\])%", "$1" + wStr).replaceAll("\\\\%", "%").replaceAll("^%", wStr)
+      .replaceAll("([^\\\\])_", "$1.").replaceAll("\\\\_", "_").replaceAll("^_", ".")
+  }
 
   override def getSession: Session = session
 
   override def getHandle: OperationHandle = handle
 
   override def getStatus: OperationStatus = {
-    OperationStatus(state, startTime, completedTime, hasResultSet, Option(operationException))
+    lastAccessTime = System.currentTimeMillis()
+    OperationStatus(
+      state,
+      createTime,
+      startTime,
+      lastAccessTime,
+      completedTime,
+      hasResultSet,
+      Option(operationException),
+      Option(operationJobProgress))
   }
 
   override def shouldRunAsync: Boolean
@@ -157,7 +222,7 @@ abstract class AbstractOperation(opType: OperationType, session: Session)
       false
     } else {
       OperationState.isTerminal(state) &&
-        lastAccessTime + operationTimeout <= System.currentTimeMillis()
+      lastAccessTime + operationTimeout <= System.currentTimeMillis()
     }
   }
 }

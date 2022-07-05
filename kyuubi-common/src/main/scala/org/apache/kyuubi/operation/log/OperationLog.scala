@@ -17,10 +17,14 @@
 
 package org.apache.kyuubi.operation.log
 
-import java.io.IOException
+import java.io.{BufferedReader, IOException}
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
+import java.util.{ArrayList => JArrayList, List => JList}
+
+import scala.collection.JavaConverters._
+import scala.collection.mutable.ListBuffer
 
 import org.apache.hive.service.rpc.thrift.{TColumn, TRow, TRowSet, TStringColumn}
 
@@ -29,7 +33,7 @@ import org.apache.kyuubi.operation.OperationHandle
 import org.apache.kyuubi.session.Session
 
 object OperationLog extends Logging {
-  private final val OPERATION_LOG: InheritableThreadLocal[OperationLog] = {
+  final private val OPERATION_LOG: InheritableThreadLocal[OperationLog] = {
     new InheritableThreadLocal[OperationLog] {
       override def initialValue(): OperationLog = null
     }
@@ -74,14 +78,28 @@ object OperationLog extends Logging {
           error(s"Failed to create operation log for $opHandle in ${session.handle}", e)
           null
       }
-    }.getOrElse(null)
+    }.orNull
   }
 }
 
 class OperationLog(path: Path) {
 
-  private val writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)
-  private val reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)
+  private lazy val writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)
+  private lazy val reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)
+
+  private lazy val extraPaths: ListBuffer[Path] = ListBuffer()
+  private lazy val extraReaders: ListBuffer[BufferedReader] = ListBuffer()
+  private var lastSeekReadPos = 0
+  private var seekableReader: SeekableBufferedReader = _
+
+  def addExtraLog(path: Path): Unit = synchronized {
+    try {
+      extraReaders += Files.newBufferedReader(path, StandardCharsets.UTF_8)
+      extraPaths += path
+    } catch {
+      case _: IOException =>
+    }
+  }
 
   /**
    * write log to the operation log file
@@ -95,38 +113,100 @@ class OperationLog(path: Path) {
     }
   }
 
-  /**
-   * Read to log file line by line
-   *
-   * @param maxRows maximum result number can reach
-   */
-  def read(maxRows: Int): TRowSet = synchronized {
-    val logs = new java.util.ArrayList[String]
+  private def readLogs(
+      reader: BufferedReader,
+      lastRows: Int,
+      maxRows: Int): (JArrayList[String], Int) = {
+    val logs = new JArrayList[String]
     var i = 0
     try {
       var line: String = reader.readLine()
-      while ((i < maxRows || maxRows <= 0) && line != null) {
+      while ((i < lastRows || maxRows <= 0) && line != null) {
         logs.add(line)
         line = reader.readLine()
         i += 1
       }
+      (logs, i)
     } catch {
       case e: IOException =>
         val absPath = path.toAbsolutePath
         val opHandle = absPath.getFileName
         throw KyuubiSQLException(s"Operation[$opHandle] log file $absPath is not found", e)
     }
+  }
+
+  private def toRowSet(logs: JList[String]): TRowSet = {
     val tColumn = TColumn.stringVal(new TStringColumn(logs, ByteBuffer.allocate(0)))
-    val tRow = new TRowSet(0, new java.util.ArrayList[TRow](logs.size()))
+    val tRow = new TRowSet(0, new JArrayList[TRow](logs.size()))
     tRow.addToColumns(tColumn)
     tRow
   }
 
+  /**
+   * Read to log file line by line
+   *
+   * @param maxRows maximum result number can reach
+   */
+  def read(maxRows: Int): TRowSet = synchronized {
+    val (logs, lines) = readLogs(reader, maxRows, maxRows)
+    var lastRows = maxRows - lines
+    for (extraReader <- extraReaders if lastRows > 0 || maxRows <= 0) {
+      val (extraLogs, extraRows) = readLogs(extraReader, lastRows, maxRows)
+      lastRows = lastRows - extraRows
+      logs.addAll(extraLogs)
+    }
+
+    toRowSet(logs)
+  }
+
+  def read(from: Int, size: Int): TRowSet = synchronized {
+    var pos = from
+    if (pos < 0) {
+      // just fetch forward
+      pos = lastSeekReadPos
+    }
+    if (seekableReader == null) {
+      seekableReader = new SeekableBufferedReader(Seq(path) ++ extraPaths)
+    } else {
+      // if from < last pos, we should reload the reader
+      // otherwise, we can reuse the existed reader for better performance
+      if (pos < lastSeekReadPos) {
+        seekableReader.close()
+        seekableReader = new SeekableBufferedReader(Seq(path) ++ extraPaths)
+      }
+    }
+
+    val it = seekableReader.readLine(pos, size)
+    val res = it.toList.asJava
+    lastSeekReadPos = pos + res.size()
+    toRowSet(res)
+  }
+
   def close(): Unit = synchronized {
-    try {
+    closeExtraReaders()
+
+    trySafely {
       reader.close()
+    }
+    trySafely {
       writer.close()
+    }
+
+    if (seekableReader != null) {
+      lastSeekReadPos = 0
+      trySafely {
+        seekableReader.close()
+      }
+    }
+
+    trySafely {
       Files.delete(path)
+    }
+  }
+
+  private def trySafely(f: => Unit): Unit = {
+    try {
+      f
     } catch {
       case e: IOException =>
         // Printing log here may cause a deadlock. The lock order of OperationLog.write
@@ -134,7 +214,18 @@ class OperationLog(path: Path) {
         // lock order is OperationLog -> RootLogger. So the exception is thrown and
         // processing at the invocations
         throw new IOException(
-          s"Failed to remove corresponding log file of operation: ${path.toAbsolutePath}", e)
+          s"Failed to remove corresponding log file of operation: ${path.toAbsolutePath}",
+          e)
+    }
+  }
+
+  private def closeExtraReaders(): Unit = {
+    extraReaders.foreach { extraReader =>
+      try {
+        extraReader.close()
+      } catch {
+        case _: IOException => // for the outside log file reader, ignore it
+      }
     }
   }
 }

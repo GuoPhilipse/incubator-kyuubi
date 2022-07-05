@@ -17,37 +17,28 @@
 
 package org.apache.kyuubi.operation
 
-import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import java.util.concurrent.TimeUnit
 
 import org.apache.hive.service.rpc.thrift.TRowSet
 
-import org.apache.kyuubi.KyuubiSQLException
-import org.apache.kyuubi.client.KyuubiSyncThriftClient
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.config.KyuubiConf.OPERATION_QUERY_TIMEOUT
+import org.apache.kyuubi.metrics.MetricsConstants.OPERATION_OPEN
+import org.apache.kyuubi.metrics.MetricsSystem
 import org.apache.kyuubi.operation.FetchOrientation.FetchOrientation
-import org.apache.kyuubi.session.{Session, SessionHandle}
+import org.apache.kyuubi.server.metadata.api.Metadata
+import org.apache.kyuubi.session.{KyuubiBatchSessionImpl, KyuubiSessionImpl, Session}
 import org.apache.kyuubi.util.ThriftUtils
 
 class KyuubiOperationManager private (name: String) extends OperationManager(name) {
 
   def this() = this(classOf[KyuubiOperationManager].getSimpleName)
 
-  private val handleToClient = new ConcurrentHashMap[SessionHandle, KyuubiSyncThriftClient]()
-
   private var queryTimeout: Option[Long] = None
 
   override def initialize(conf: KyuubiConf): Unit = {
     queryTimeout = conf.get(OPERATION_QUERY_TIMEOUT).map(TimeUnit.MILLISECONDS.toSeconds)
     super.initialize(conf)
-  }
-
-  private def getThriftClient(sessionHandle: SessionHandle): KyuubiSyncThriftClient = {
-    val client = handleToClient.get(sessionHandle)
-    if (client == null) {
-      throw KyuubiSQLException(s"$sessionHandle has not been initialized or already been closed")
-    }
-    client
   }
 
   private def getQueryTimeout(clientQueryTimeout: Long): Long = {
@@ -61,34 +52,63 @@ class KyuubiOperationManager private (name: String) extends OperationManager(nam
     }
   }
 
-  def setConnection(sessionHandle: SessionHandle, client: KyuubiSyncThriftClient): Unit = {
-    handleToClient.put(sessionHandle, client)
-  }
-
-  def removeConnection(sessionHandle: SessionHandle): Unit = {
-    handleToClient.remove(sessionHandle)
-  }
-
   override def newExecuteStatementOperation(
       session: Session,
       statement: String,
+      confOverlay: Map[String, String],
       runAsync: Boolean,
       queryTimeout: Long): Operation = {
-    val client = getThriftClient(session.handle)
-    val operation = new ExecuteStatement(session, client, statement, runAsync,
-      getQueryTimeout(queryTimeout))
+    val operation =
+      new ExecuteStatement(session, statement, confOverlay, runAsync, getQueryTimeout(queryTimeout))
     addOperation(operation)
   }
 
+  def newBatchJobSubmissionOperation(
+      session: KyuubiBatchSessionImpl,
+      batchType: String,
+      batchName: String,
+      resource: String,
+      className: String,
+      batchConf: Map[String, String],
+      batchArgs: Seq[String],
+      recoveryMetadata: Option[Metadata]): BatchJobSubmission = {
+    val operation = new BatchJobSubmission(
+      session,
+      batchType,
+      batchName,
+      resource,
+      className,
+      batchConf,
+      batchArgs,
+      recoveryMetadata)
+    addOperation(operation)
+    operation
+  }
+
+  // The server does not use these 4 operations
+  override def newSetCurrentCatalogOperation(session: Session, catalog: String): Operation = {
+    null
+  }
+
+  override def newGetCurrentCatalogOperation(session: Session): Operation = {
+    null
+  }
+
+  override def newSetCurrentDatabaseOperation(session: Session, database: String): Operation = {
+    null
+  }
+
+  override def newGetCurrentDatabaseOperation(session: Session): Operation = {
+    null
+  }
+
   override def newGetTypeInfoOperation(session: Session): Operation = {
-    val client = getThriftClient(session.handle)
-    val operation = new GetTypeInfo(session, client)
+    val operation = new GetTypeInfo(session)
     addOperation(operation)
   }
 
   override def newGetCatalogsOperation(session: Session): Operation = {
-    val client = getThriftClient(session.handle)
-    val operation = new GetCatalogs(session, client)
+    val operation = new GetCatalogs(session)
     addOperation(operation)
   }
 
@@ -96,8 +116,7 @@ class KyuubiOperationManager private (name: String) extends OperationManager(nam
       session: Session,
       catalog: String,
       schema: String): Operation = {
-    val client = getThriftClient(session.handle)
-    val operation = new GetSchemas(session, client, catalog, schema)
+    val operation = new GetSchemas(session, catalog, schema)
     addOperation(operation)
   }
 
@@ -107,15 +126,12 @@ class KyuubiOperationManager private (name: String) extends OperationManager(nam
       schemaName: String,
       tableName: String,
       tableTypes: java.util.List[String]): Operation = {
-    val client = getThriftClient(session.handle)
-    val operation = new GetTables(
-      session, client, catalogName, schemaName, tableName, tableTypes)
+    val operation = new GetTables(session, catalogName, schemaName, tableName, tableTypes)
     addOperation(operation)
   }
 
   override def newGetTableTypesOperation(session: Session): Operation = {
-    val client = getThriftClient(session.handle)
-    val operation = new GetTableTypes(session, client)
+    val operation = new GetTableTypes(session)
     addOperation(operation)
   }
 
@@ -125,8 +141,7 @@ class KyuubiOperationManager private (name: String) extends OperationManager(nam
       schemaName: String,
       tableName: String,
       columnName: String): Operation = {
-    val client = getThriftClient(session.handle)
-    val operation = new GetColumns(session, client, catalogName, schemaName, tableName, columnName)
+    val operation = new GetColumns(session, catalogName, schemaName, tableName, columnName)
     addOperation(operation)
   }
 
@@ -135,14 +150,59 @@ class KyuubiOperationManager private (name: String) extends OperationManager(nam
       catalogName: String,
       schemaName: String,
       functionName: String): Operation = {
-    val client = getThriftClient(session.handle)
-    val operation = new GetFunctions(session, client, catalogName, schemaName, functionName)
+    val operation = new GetFunctions(session, catalogName, schemaName, functionName)
+    addOperation(operation)
+  }
+
+  override def newGetPrimaryKeysOperation(
+      session: Session,
+      catalogName: String,
+      schemaName: String,
+      tableName: String): Operation = {
+    val operation = new GetPrimaryKeys(session, catalogName, schemaName, tableName)
+    addOperation(operation)
+  }
+
+  override def newGetCrossReferenceOperation(
+      session: Session,
+      primaryCatalog: String,
+      primarySchema: String,
+      primaryTable: String,
+      foreignCatalog: String,
+      foreignSchema: String,
+      foreignTable: String): Operation = {
+    val operation = new GetCrossReference(
+      session,
+      primaryCatalog,
+      primarySchema,
+      primaryTable,
+      foreignCatalog,
+      foreignSchema,
+      foreignTable)
+    addOperation(operation)
+  }
+
+  override def getQueryId(operation: Operation): String = {
+    val kyuubiOperation = operation.asInstanceOf[KyuubiOperation]
+    val client = kyuubiOperation.client
+    val remoteHandle = kyuubiOperation.remoteOpHandle()
+    if (remoteHandle != null) {
+      val queryId = client.getQueryId(remoteHandle).getQueryId
+      queryId
+    } else {
+      null
+    }
+  }
+
+  def newLaunchEngineOperation(session: KyuubiSessionImpl, shouldRunAsync: Boolean): Operation = {
+    val operation = new LaunchEngine(session, shouldRunAsync)
     addOperation(operation)
   }
 
   override def getOperationLogRowSet(
       opHandle: OperationHandle,
-      order: FetchOrientation, maxRows: Int): TRowSet = {
+      order: FetchOrientation,
+      maxRows: Int): TRowSet = {
 
     val operation = getOperation(opHandle).asInstanceOf[KyuubiOperation]
     val operationLog = operation.getOperationLog
@@ -150,12 +210,17 @@ class KyuubiOperationManager private (name: String) extends OperationManager(nam
       case Some(log) => log.read(maxRows)
       case None =>
         val remoteHandle = operation.remoteOpHandle()
-        val client = getThriftClient(operation.getSession.handle)
+        val client = operation.client
         if (remoteHandle != null) {
           client.fetchResults(remoteHandle, order, maxRows, fetchLog = true)
         } else {
           ThriftUtils.EMPTY_ROW_SET
         }
     }
+  }
+
+  override def start(): Unit = synchronized {
+    MetricsSystem.tracing(_.registerGauge(OPERATION_OPEN, getOperationCount, 0))
+    super.start()
   }
 }

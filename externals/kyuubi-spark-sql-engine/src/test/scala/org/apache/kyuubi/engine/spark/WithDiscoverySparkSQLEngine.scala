@@ -17,12 +17,12 @@
 
 package org.apache.kyuubi.engine.spark
 
-import org.apache.curator.framework.CuratorFramework
-
 import org.apache.kyuubi.Utils
 import org.apache.kyuubi.config.KyuubiConf
-import org.apache.kyuubi.ha.HighAvailabilityConf.{HA_ZK_ACL_ENABLED, HA_ZK_NAMESPACE, HA_ZK_QUORUM}
-import org.apache.kyuubi.ha.client.ZooKeeperClientProvider
+import org.apache.kyuubi.ha.HighAvailabilityConf.{HA_ADDRESSES, HA_NAMESPACE, HA_ZK_AUTH_TYPE}
+import org.apache.kyuubi.ha.client.AuthTypes
+import org.apache.kyuubi.ha.client.DiscoveryClient
+import org.apache.kyuubi.ha.client.DiscoveryClientProvider
 import org.apache.kyuubi.zookeeper.{EmbeddedZookeeper, ZookeeperConf}
 
 trait WithDiscoverySparkSQLEngine extends WithSparkSQLEngine {
@@ -30,9 +30,10 @@ trait WithDiscoverySparkSQLEngine extends WithSparkSQLEngine {
   def namespace: String
   override def withKyuubiConf: Map[String, String] = {
     assert(zkServer != null)
-    Map(HA_ZK_QUORUM.key -> zkServer.getConnectString,
-      HA_ZK_ACL_ENABLED.key -> "false",
-      HA_ZK_NAMESPACE.key -> namespace)
+    Map(
+      HA_ADDRESSES.key -> zkServer.getConnectString,
+      HA_ZK_AUTH_TYPE.key -> AuthTypes.NONE.toString,
+      HA_NAMESPACE.key -> namespace)
   }
 
   override def beforeAll(): Unit = {
@@ -61,8 +62,8 @@ trait WithDiscoverySparkSQLEngine extends WithSparkSQLEngine {
     stopSparkEngine()
   }
 
-  def withZkClient(f: CuratorFramework => Unit): Unit = {
-    ZooKeeperClientProvider.withZkClient(kyuubiConf)(f)
+  def withDiscoveryClient(f: DiscoveryClient => Unit): Unit = {
+    DiscoveryClientProvider.withDiscoveryClient(kyuubiConf)(f)
   }
 
   protected def getDiscoveryConnectionString: String = {

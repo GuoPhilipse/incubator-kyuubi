@@ -19,14 +19,13 @@ package org.apache.kyuubi.server.api
 
 import javax.servlet.ServletContext
 import javax.servlet.http.HttpServletRequest
-import javax.ws.rs.core.Context
+import javax.ws.rs.WebApplicationException
+import javax.ws.rs.core.{Context, MediaType, Response}
+import javax.ws.rs.ext.{ExceptionMapper, Provider}
 
 import org.eclipse.jetty.server.handler.ContextHandler
-import org.eclipse.jetty.servlet.{ServletContextHandler, ServletHolder}
-import org.glassfish.jersey.server.ServerProperties
-import org.glassfish.jersey.servlet.ServletContainer
 
-import org.apache.kyuubi.service.BackendService
+import org.apache.kyuubi.server.KyuubiRestFrontendService
 
 private[api] trait ApiRequestContext {
 
@@ -36,37 +35,36 @@ private[api] trait ApiRequestContext {
   @Context
   protected var httpRequest: HttpServletRequest = _
 
-  def backendService: BackendService = BackendServiceProvider.getBackendService(servletContext)
-
+  final protected def fe: KyuubiRestFrontendService = FrontendServiceContext.get(servletContext)
 }
 
-private[api] object BackendServiceProvider {
+@Provider
+class RestExceptionMapper extends ExceptionMapper[Exception] {
+  override def toResponse(exception: Exception): Response = {
+    exception match {
+      case e: WebApplicationException =>
+        Response.status(e.getResponse.getStatus)
+          .`type`(e.getResponse.getMediaType)
+          .entity(e.getMessage)
+          .build()
+      case e =>
+        Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+          .`type`(MediaType.APPLICATION_JSON)
+          .entity(e.getMessage)
+          .build()
+    }
+  }
+}
+
+private[api] object FrontendServiceContext {
 
   private val attribute = getClass.getCanonicalName
 
-  def setBackendService(contextHandler: ContextHandler, be: BackendService): Unit = {
-    contextHandler.setAttribute(attribute, be)
+  def set(contextHandler: ContextHandler, fe: KyuubiRestFrontendService): Unit = {
+    contextHandler.setAttribute(attribute, fe)
   }
 
-  def getBackendService(context: ServletContext): BackendService = {
-    context.getAttribute(attribute).asInstanceOf[BackendService]
-  }
-}
-
-private[server] object ApiUtils {
-
-  def getServletHandler(backendService: BackendService): ServletContextHandler = {
-    val servlet = new ServletHolder(classOf[ServletContainer])
-    servlet.setInitParameter(
-      ServerProperties.PROVIDER_PACKAGES,
-      "org.apache.kyuubi.server.api.v1")
-    servlet.setInitParameter(
-      ServerProperties.PROVIDER_CLASSNAMES,
-      classOf[KyuubiScalaObjectMapper].getName)
-    val handler = new ServletContextHandler(ServletContextHandler.NO_SESSIONS)
-    BackendServiceProvider.setBackendService(handler, backendService)
-    handler.setContextPath("/api")
-    handler.addServlet(servlet, "/*")
-    handler
+  def get(context: ServletContext): KyuubiRestFrontendService = {
+    context.getAttribute(attribute).asInstanceOf[KyuubiRestFrontendService]
   }
 }

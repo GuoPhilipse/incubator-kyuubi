@@ -21,6 +21,7 @@ import org.apache.hive.service.rpc.thrift._
 
 import org.apache.kyuubi.KyuubiSQLException
 import org.apache.kyuubi.config.KyuubiConf
+import org.apache.kyuubi.config.KyuubiReservedKeys._
 import org.apache.kyuubi.operation.FetchOrientation.FetchOrientation
 import org.apache.kyuubi.operation.OperationState._
 import org.apache.kyuubi.operation.log.LogDivertAppender
@@ -30,25 +31,31 @@ import org.apache.kyuubi.session.Session
 /**
  * The [[OperationManager]] manages all the operations during their lifecycle.
  *
- *
  * @param name Service Name
  */
 abstract class OperationManager(name: String) extends AbstractService(name) {
 
-  private final val handleToOperation = new java.util.HashMap[OperationHandle, Operation]()
+  final private val handleToOperation = new java.util.HashMap[OperationHandle, Operation]()
+
+  protected def skipOperationLog: Boolean = false
 
   def getOperationCount: Int = handleToOperation.size()
 
   override def initialize(conf: KyuubiConf): Unit = {
-    LogDivertAppender.initialize()
+    LogDivertAppender.initialize(skipOperationLog)
     super.initialize(conf)
   }
 
   def newExecuteStatementOperation(
       session: Session,
       statement: String,
+      confOverlay: Map[String, String],
       runAsync: Boolean,
       queryTimeout: Long): Operation
+  def newSetCurrentCatalogOperation(session: Session, catalog: String): Operation
+  def newGetCurrentCatalogOperation(session: Session): Operation
+  def newSetCurrentDatabaseOperation(session: Session, database: String): Operation
+  def newGetCurrentDatabaseOperation(session: Session): Operation
   def newGetTypeInfoOperation(session: Session): Operation
   def newGetCatalogsOperation(session: Session): Operation
   def newGetSchemasOperation(session: Session, catalog: String, schema: String): Operation
@@ -70,6 +77,20 @@ abstract class OperationManager(name: String) extends AbstractService(name) {
       catalogName: String,
       schemaName: String,
       functionName: String): Operation
+  def newGetPrimaryKeysOperation(
+      session: Session,
+      catalogName: String,
+      schemaName: String,
+      tableName: String): Operation
+  def newGetCrossReferenceOperation(
+      session: Session,
+      primaryCatalog: String,
+      primarySchema: String,
+      primaryTable: String,
+      foreignCatalog: String,
+      foreignSchema: String,
+      foreignTable: String): Operation
+  def getQueryId(operation: Operation): String
 
   final def addOperation(operation: Operation): Operation = synchronized {
     handleToOperation.put(operation.getHandle, operation)
@@ -121,7 +142,7 @@ abstract class OperationManager(name: String) extends AbstractService(name) {
       order: FetchOrientation,
       maxRows: Int): TRowSet = {
     val operationLog = getOperation(opHandle).getOperationLog
-    operationLog.map(_.read(maxRows)).getOrElse{
+    operationLog.map(_.read(maxRows)).getOrElse {
       throw KyuubiSQLException(s"$opHandle failed to generate operation log")
     }
   }
@@ -136,6 +157,32 @@ abstract class OperationManager(name: String) extends AbstractService(name) {
       } else {
         false
       }
+    }
+  }
+
+  private val PATTERN_FOR_SET_CATALOG = "_SET_CATALOG"
+  private val PATTERN_FOR_GET_CATALOG = "_GET_CATALOG"
+  private val PATTERN_FOR_SET_SCHEMA = "(?i)use (.*)".r
+  private val PATTERN_FOR_GET_SCHEMA = "select current_database()"
+
+  final def processCatalogDatabase(
+      session: Session,
+      statement: String,
+      confOverlay: Map[String, String]): Operation = {
+    if (confOverlay.contains(KYUUBI_OPERATION_SET_CURRENT_CATALOG)
+      && statement == PATTERN_FOR_SET_CATALOG) {
+      newSetCurrentCatalogOperation(session, confOverlay(KYUUBI_OPERATION_SET_CURRENT_CATALOG))
+    } else if (confOverlay.contains(KYUUBI_OPERATION_GET_CURRENT_CATALOG)
+      && statement == PATTERN_FOR_GET_CATALOG) {
+      newGetCurrentCatalogOperation(session)
+    } else if (confOverlay.contains(KYUUBI_OPERATION_SET_CURRENT_DATABASE)
+      && PATTERN_FOR_SET_SCHEMA.unapplySeq(statement).isDefined) {
+      newSetCurrentDatabaseOperation(session, confOverlay(KYUUBI_OPERATION_SET_CURRENT_DATABASE))
+    } else if (confOverlay.contains(KYUUBI_OPERATION_GET_CURRENT_DATABASE)
+      && PATTERN_FOR_GET_SCHEMA == statement.toLowerCase) {
+      newGetCurrentDatabaseOperation(session)
+    } else {
+      null
     }
   }
 }

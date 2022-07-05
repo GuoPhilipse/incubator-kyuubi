@@ -17,14 +17,33 @@
 
 package org.apache.kyuubi.server.api.v1
 
-import com.google.common.annotations.VisibleForTesting
 import javax.ws.rs.{GET, Path, Produces}
 import javax.ws.rs.core.{MediaType, Response}
 
-import org.apache.kyuubi.server.api.ApiRequestContext
+import com.google.common.annotations.VisibleForTesting
+import io.swagger.v3.oas.annotations.media.Content
+import io.swagger.v3.oas.annotations.responses.ApiResponse
+import org.eclipse.jetty.servlet.{ServletContextHandler, ServletHolder}
+import org.glassfish.jersey.server.ResourceConfig
+import org.glassfish.jersey.servlet.ServletContainer
+
+import org.apache.kyuubi.KYUUBI_VERSION
+import org.apache.kyuubi.client.api.v1.dto._
+import org.apache.kyuubi.server.KyuubiRestFrontendService
+import org.apache.kyuubi.server.api.{ApiRequestContext, FrontendServiceContext, OpenAPIConfig}
 
 @Path("/v1")
 private[v1] class ApiRootResource extends ApiRequestContext {
+
+  @ApiResponse(
+    responseCode = "200",
+    content = Array(new Content(
+      mediaType = MediaType.APPLICATION_JSON)),
+    description = "Get the version of Kyuubi server.")
+  @GET
+  @Path("version")
+  @Produces(Array(MediaType.APPLICATION_JSON))
+  def version(): VersionInfo = new VersionInfo(KYUUBI_VERSION)
 
   @GET
   @Path("ping")
@@ -34,6 +53,15 @@ private[v1] class ApiRootResource extends ApiRequestContext {
   @Path("sessions")
   def sessions: Class[SessionsResource] = classOf[SessionsResource]
 
+  @Path("operations")
+  def operations: Class[OperationsResource] = classOf[OperationsResource]
+
+  @Path("batches")
+  def batches: Class[BatchesResource] = classOf[BatchesResource]
+
+  @Path("admin")
+  def admin: Class[AdminResource] = classOf[AdminResource]
+
   @GET
   @Path("exception")
   @Produces(Array(MediaType.TEXT_PLAIN))
@@ -42,5 +70,17 @@ private[v1] class ApiRootResource extends ApiRequestContext {
     1 / 0
     Response.ok().build()
   }
+}
 
+private[server] object ApiRootResource {
+
+  def getServletHandler(fe: KyuubiRestFrontendService): ServletContextHandler = {
+    val openapiConf: ResourceConfig = new OpenAPIConfig
+    val holder = new ServletHolder(new ServletContainer(openapiConf))
+    val handler = new ServletContextHandler(ServletContextHandler.NO_SESSIONS)
+    handler.setContextPath("/api")
+    FrontendServiceContext.set(handler, fe)
+    handler.addServlet(holder, "/*")
+    handler
+  }
 }

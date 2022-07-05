@@ -15,11 +15,6 @@
  - limitations under the License.
  -->
 
-<div align=center>
-
-![](../../imgs/kyuubi_logo.png)
-
-</div>
 
 # How To Use Spark Dynamic Resource Allocation (DRA) in Kyuubi
 
@@ -157,7 +152,7 @@ After finish one task,  Spark Driver will schedule a new task for the executor w
 
 </div>
 
-If one executor reach the maximn timeout, it will be removed.
+If one executor reached the maximum timeout, it will be removed.
 ```properties
 spark.dynamicAllocation.executorIdleTimeout=60s
 spark.dynamicAllocation.cachedExecutorIdleTimeout=infinity

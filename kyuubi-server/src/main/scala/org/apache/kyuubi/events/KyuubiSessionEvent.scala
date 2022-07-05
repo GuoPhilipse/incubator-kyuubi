@@ -18,47 +18,56 @@
 package org.apache.kyuubi.events
 
 import org.apache.kyuubi.Utils
-import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.server.KyuubiServer
-import org.apache.kyuubi.session.KyuubiSessionImpl
+import org.apache.kyuubi.session.KyuubiSession
 
 /**
  * @param sessionId server session id
+ * @param clientVersion client version
+ * @param sessionType the session type
  * @param sessionName if user not specify it, we use empty string instead
  * @param user session user
  * @param clientIP client ip address
  * @param serverIP A unique Kyuubi server id, e.g. kyuubi server ip address and port,
  *                 it is useful if has multi-instance Kyuubi Server
- * @param clientVersion client version
  * @param conf session config
  * @param startTime session create time
+ * @param remoteSessionId remote engine session id
+ * @param engineId engine id. For engine on yarn, it is applicationId.
  * @param openedTime session opened time
  * @param endTime session end time
  * @param totalOperations how many queries and meta calls
+ * @param exception the session exception, such as the exception that occur when opening session
  */
 case class KyuubiSessionEvent(
+    sessionId: String,
+    clientVersion: Int,
+    sessionType: String,
     sessionName: String,
     user: String,
     clientIP: String,
     serverIP: String,
     conf: Map[String, String],
     startTime: Long,
-    var sessionId: String = "",
-    var clientVersion: Int = -1,
+    var remoteSessionId: String = "",
+    var engineId: String = "",
     var openedTime: Long = -1L,
     var endTime: Long = -1L,
-    var totalOperations: Int = 0) extends KyuubiServerEvent {
+    var totalOperations: Int = 0,
+    var exception: Option[Throwable] = None) extends KyuubiEvent {
   override def partitions: Seq[(String, String)] =
     ("day", Utils.getDateFromTimestamp(startTime)) :: Nil
 }
 
 object KyuubiSessionEvent {
-  def apply(session: KyuubiSessionImpl): KyuubiSessionEvent = {
+  def apply(session: KyuubiSession): KyuubiSessionEvent = {
     assert(KyuubiServer.kyuubiServer != null)
     val serverIP = KyuubiServer.kyuubiServer.frontendServices.head.connectionUrl
-    val sessionName: String = session.normalizedConf.getOrElse(KyuubiConf.SESSION_NAME.key, "")
     KyuubiSessionEvent(
-      sessionName,
+      session.handle.toString,
+      session.protocol.getValue,
+      session.sessionType.toString,
+      session.name.getOrElse(""),
       session.user,
       session.ipAddress,
       serverIP,

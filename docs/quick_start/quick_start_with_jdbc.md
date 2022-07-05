@@ -15,11 +15,6 @@
  - limitations under the License.
  -->
 
-<div align=center>
-
-![](../imgs/kyuubi_logo.png)
-
-</div>
 
 # Getting Started With Hive JDBC
 
@@ -35,7 +30,7 @@ Add repository to your maven configuration file which may reside in `$MAVEN_HOME
     <name>central maven repo https</name>
     <url>https://repo.maven.apache.org/maven2</url>
   </repository>
-<repositories>
+</repositories>
 ```
 You can add below dependency to your `pom.xml` file in your application.
 

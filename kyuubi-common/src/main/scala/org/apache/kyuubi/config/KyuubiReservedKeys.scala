@@ -1,0 +1,33 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kyuubi.config
+
+object KyuubiReservedKeys {
+  final val KYUUBI_SESSION_USER_KEY = "kyuubi.session.user"
+  final val KYUUBI_STATEMENT_ID_KEY = "kyuubi.statement.id"
+  final val KYUUBI_ENGINE_SUBMIT_TIME_KEY = "kyuubi.engine.submit.time"
+  final val KYUUBI_ENGINE_CREDENTIALS_KEY = "kyuubi.engine.credentials"
+  final val KYUUBI_SESSION_ENGINE_LAUNCH_HANDLE_GUID =
+    "kyuubi.session.engine.launch.handle.guid"
+  final val KYUUBI_SESSION_ENGINE_LAUNCH_HANDLE_SECRET =
+    "kyuubi.session.engine.launch.handle.secret"
+  final val KYUUBI_OPERATION_SET_CURRENT_CATALOG = "kyuubi.operation.set.current.catalog"
+  final val KYUUBI_OPERATION_GET_CURRENT_CATALOG = "kyuubi.operation.get.current.catalog"
+  final val KYUUBI_OPERATION_SET_CURRENT_DATABASE = "kyuubi.operation.set.current.database"
+  final val KYUUBI_OPERATION_GET_CURRENT_DATABASE = "kyuubi.operation.get.current.database"
+}

@@ -27,19 +27,25 @@ import org.apache.hadoop.security.authentication.util.KerberosName
 import org.apache.hadoop.security.authorize.ProxyUsers
 import org.apache.hive.service.rpc.thrift.TCLIService.Iface
 import org.apache.thrift.TProcessorFactory
-import org.apache.thrift.transport.{TTransportException, TTransportFactory}
+import org.apache.thrift.transport.{TSaslServerTransport, TTransportException, TTransportFactory}
 
-import org.apache.kyuubi.KyuubiSQLException
+import org.apache.kyuubi.{KyuubiSQLException, Logging}
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.config.KyuubiConf._
+import org.apache.kyuubi.service.authentication.AuthMethods.AuthMethod
 import org.apache.kyuubi.service.authentication.AuthTypes._
 
-class KyuubiAuthenticationFactory(conf: KyuubiConf) {
+class KyuubiAuthenticationFactory(conf: KyuubiConf, isServer: Boolean = true) extends Logging {
 
-  private val authType: AuthType = AuthTypes.withName(conf.get(AUTHENTICATION_METHOD))
+  private val authTypes = conf.get(AUTHENTICATION_METHOD).map(AuthTypes.withName)
+  private val none = authTypes.contains(NONE)
+  private val noSasl = authTypes == Seq(NOSASL)
+  private val kerberosEnabled = authTypes.contains(KERBEROS)
+  private val plainAuthTypeOpt = authTypes.filterNot(_.equals(KERBEROS))
+    .filterNot(_.equals(NOSASL)).headOption
 
-  private val saslServer: Option[HadoopThriftAuthBridgeServer] = authType match {
-    case KERBEROS =>
+  private val hadoopAuthServer: Option[HadoopThriftAuthBridgeServer] = {
+    if (kerberosEnabled) {
       val secretMgr = KyuubiDelegationTokenManager(conf)
       try {
         secretMgr.startThreads()
@@ -47,7 +53,13 @@ class KyuubiAuthenticationFactory(conf: KyuubiConf) {
         case e: IOException => throw new TTransportException("Failed to start token manager", e)
       }
       Some(new HadoopThriftAuthBridgeServer(secretMgr))
-    case _ => None
+    } else {
+      None
+    }
+  }
+
+  if (conf.get(ENGINE_SECURITY_ENABLED)) {
+    InternalSecurityAccessor.initialize(conf, isServer)
   }
 
   private def getSaslProperties: java.util.Map[String, String] = {
@@ -59,35 +71,77 @@ class KyuubiAuthenticationFactory(conf: KyuubiConf) {
   }
 
   def getTTransportFactory: TTransportFactory = {
-    saslServer match {
-      case Some(server) =>
-        val serverTransportFactory = try {
-          server.createSaslServerTransportFactory(getSaslProperties)
-        } catch {
-          case e: TTransportException => throw new LoginException(e.getMessage)
-        }
+    if (noSasl) {
+      new TTransportFactory()
+    } else {
+      var transportFactory: TSaslServerTransport.Factory = null
 
-        server.wrapTransportFactory(serverTransportFactory)
+      hadoopAuthServer match {
+        case Some(server) =>
+          transportFactory =
+            try {
+              server.createSaslServerTransportFactory(getSaslProperties)
+            } catch {
+              case e: TTransportException => throw new LoginException(e.getMessage)
+            }
 
-      case _ => authType match {
-        case NOSASL => new TTransportFactory
-        case _ => PlainSASLHelper.getTransportFactory(authType.toString, conf)
+        case _ =>
+      }
+
+      plainAuthTypeOpt match {
+        case Some(plainAuthType) =>
+          transportFactory = PlainSASLHelper.getTransportFactory(
+            plainAuthType.toString,
+            conf,
+            Option(transportFactory),
+            isServer).asInstanceOf[TSaslServerTransport.Factory]
+
+        case _ =>
+      }
+
+      hadoopAuthServer match {
+        case Some(server) => server.wrapTransportFactory(transportFactory)
+        case _ => transportFactory
       }
     }
   }
 
-  def getTProcessorFactory(fe: Iface): TProcessorFactory = saslServer match {
+  def getTProcessorFactory(fe: Iface): TProcessorFactory = hadoopAuthServer match {
     case Some(server) => FEServiceProcessorFactory(server, fe)
     case _ => PlainSASLHelper.getProcessFactory(fe)
   }
 
   def getRemoteUser: Option[String] = {
-    saslServer.map(_.getRemoteUser).orElse(Option(TSetIpAddressProcessor.getUserName))
+    hadoopAuthServer.map(_.getRemoteUser).orElse(Option(TSetIpAddressProcessor.getUserName))
   }
 
   def getIpAddress: Option[String] = {
-    saslServer.map(_.getRemoteAddress).map(_.getHostAddress)
+    hadoopAuthServer.map(_.getRemoteAddress).map(_.getHostAddress)
       .orElse(Option(TSetIpAddressProcessor.getUserIpAddress))
+  }
+
+  def isNoSaslEnabled: Boolean = {
+    noSasl
+  }
+
+  def isKerberosEnabled: Boolean = {
+    kerberosEnabled
+  }
+
+  def isPlainAuthEnabled: Boolean = {
+    plainAuthTypeOpt.isDefined
+  }
+
+  def isNoneEnabled: Boolean = {
+    none
+  }
+
+  def getValidPasswordAuthMethod: AuthMethod = {
+    debug(authTypes)
+    if (none) AuthMethods.NONE
+    else if (authTypes.contains(LDAP)) AuthMethods.LDAP
+    else if (authTypes.contains(CUSTOM)) AuthMethods.CUSTOM
+    else throw new IllegalArgumentException("No valid Password Auth detected")
   }
 }
 object KyuubiAuthenticationFactory {
@@ -118,7 +172,8 @@ object KyuubiAuthenticationFactory {
     } catch {
       case e: IOException =>
         throw KyuubiSQLException(
-          "Failed to validate proxy privilege of " + realUser + " for " + proxyUser, e)
+          "Failed to validate proxy privilege of " + realUser + " for " + proxyUser,
+          e)
     }
   }
 }

@@ -22,7 +22,7 @@
     <parent>
         <groupId>org.apache.kyuubi</groupId>
         <artifactId>kyuubi-parent</artifactId>
-        <version>1.4.0-SNAPSHOT</version>
+        <version>1.6.0-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -30,11 +30,18 @@
     <artifactId>kyuubi-spark-sql-engine_2.12</artifactId>
     <name>Kyuubi Project Engine Spark SQL</name>
     <packaging>jar</packaging>
+    <url>https://kyuubi.apache.org/</url>
 
     <dependencies>
         <dependency>
             <groupId>org.apache.kyuubi</groupId>
             <artifactId>kyuubi-common_${scala.binary.version}</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.kyuubi</groupId>
+            <artifactId>kyuubi-events_${scala.binary.version}</artifactId>
             <version>${project.version}</version>
         </dependency>
 
@@ -47,6 +54,24 @@
         <dependency>
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-sql_${scala.binary.version}</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-repl_${scala.binary.version}</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.scala-lang</groupId>
+            <artifactId>scala-compiler</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.scala-lang</groupId>
+            <artifactId>scala-reflect</artifactId>
             <scope>provided</scope>
         </dependency>
 
@@ -113,8 +138,20 @@
         </dependency>
 
         <dependency>
+            <groupId>org.apache.parquet</groupId>
+            <artifactId>parquet-avro</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-avro_${scala.binary.version}</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.hudi</groupId>
+            <artifactId>hudi-common</artifactId>
             <scope>test</scope>
         </dependency>
 
@@ -126,19 +163,13 @@
 
         <dependency>
             <groupId>org.apache.hudi</groupId>
-            <artifactId>hudi-spark3_${scala.binary.version}</artifactId>
-            <scope>test</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.apache.parquet</groupId>
-            <artifactId>parquet-avro</artifactId>
+            <artifactId>hudi-spark_${scala.binary.version}</artifactId>
             <scope>test</scope>
         </dependency>
 
         <dependency>
             <groupId>org.apache.hudi</groupId>
-            <artifactId>hudi-spark_${scala.binary.version}</artifactId>
+            <artifactId>hudi-spark3.1.x_${scala.binary.version}</artifactId>
             <scope>test</scope>
         </dependency>
 
@@ -168,18 +199,60 @@
                     <artifactSet>
                         <includes>
                             <include>org.apache.kyuubi:kyuubi-common_${scala.binary.version}</include>
+                            <include>org.apache.kyuubi:kyuubi-events_${scala.binary.version}</include>
                             <include>org.apache.kyuubi:kyuubi-ha_${scala.binary.version}</include>
                             <include>org.apache.curator:curator-client</include>
                             <include>org.apache.curator:curator-framework</include>
                             <include>org.apache.curator:curator-recipes</include>
+                            <include>org.apache.hive:hive-service-rpc</include>
+                            <include>org.apache.thrift:*</include>
                         </includes>
                     </artifactSet>
+                    <filters>
+                        <filter>
+                            <artifact>*:*</artifact>
+                            <excludes>
+                                <exclude>META-INF/*.SF</exclude>
+                                <exclude>META-INF/*.DSA</exclude>
+                                <exclude>META-INF/*.RSA</exclude>
+                                <exclude>META-INF/DEPENDENCIES</exclude>
+                                <exclude>META-INF/LICENSE.txt</exclude>
+                                <exclude>META-INF/NOTICE.txt</exclude>
+                                <exclude>META-INF/maven/**</exclude>
+                                <exclude>LICENSE.txt</exclude>
+                                <exclude>NOTICE.txt</exclude>
+                                <exclude>mozilla/**</exclude>
+                                <exclude>**/module-info.class</exclude>
+                            </excludes>
+                        </filter>
+                    </filters>
                     <relocations>
                         <relocation>
                             <pattern>org.apache.curator</pattern>
                             <shadedPattern>${kyuubi.shade.packageName}.org.apache.curator</shadedPattern>
                             <includes>
                                 <include>org.apache.curator.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
+                            <pattern>org.apache.hive.service.rpc.thrift</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.org.apache.hive.service.rpc.thrift</shadedPattern>
+                            <includes>
+                                <include>org.apache.hive.service.rpc.thrift.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
+                            <pattern>com.facebook.fb303</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.com.facebook.fb303</shadedPattern>
+                            <includes>
+                                <include>com.facebook.fb303.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
+                            <pattern>org.apache.thrift</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.org.apache.thrift</shadedPattern>
+                            <includes>
+                                <include>org.apache.thrift.**</include>
                             </includes>
                         </relocation>
                     </relocations>

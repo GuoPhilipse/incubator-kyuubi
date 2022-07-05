@@ -18,26 +18,36 @@
 package org.apache.kyuubi.operation
 
 import java.sql.SQLException
+import java.util
+import java.util.Properties
 
-import org.apache.hive.service.rpc.thrift.{TExecuteStatementReq, TGetOperationStatusReq, TOperationState, TStatusCode}
+import scala.collection.JavaConverters._
+
+import org.apache.hive.service.rpc.thrift._
 import org.scalatest.time.SpanSugar.convertIntToGrainOfTime
 
-import org.apache.kyuubi.Utils
 import org.apache.kyuubi.WithKyuubiServer
 import org.apache.kyuubi.config.KyuubiConf
+import org.apache.kyuubi.config.KyuubiConf.SESSION_CONF_ADVISOR
+import org.apache.kyuubi.jdbc.KyuubiHiveDriver
+import org.apache.kyuubi.jdbc.hive.KyuubiConnection
+import org.apache.kyuubi.plugin.SessionConfAdvisor
 
 /**
  * UT with Connection level engine shared cost much time, only run basic jdbc tests.
  */
-class KyuubiOperationPerConnectionSuite extends WithKyuubiServer with JDBCTestUtils {
+class KyuubiOperationPerConnectionSuite extends WithKyuubiServer with HiveJDBCTestHelper {
 
-  override protected def jdbcUrl: String = getJdbcUrl
+  override protected def jdbcUrl: String =
+    s"jdbc:kyuubi://${server.frontendServices.head.connectionUrl}/;"
+  override protected val URL_PREFIX: String = "jdbc:kyuubi://"
 
   override protected val conf: KyuubiConf = {
     KyuubiConf().set(KyuubiConf.ENGINE_SHARE_LEVEL, "connection")
+      .set(SESSION_CONF_ADVISOR.key, classOf[TestSessionConfAdvisor].getName)
   }
 
-  test("KYUUBI #647 - engine crash") {
+  test("KYUUBI #647 - async query causes engine crash") {
     withSessionHandle { (client, handle) =>
       val executeStmtReq = new TExecuteStatementReq()
       executeStmtReq.setStatement("select java_method('java.lang.System', 'exit', 1)")
@@ -55,14 +65,157 @@ class KyuubiOperationPerConnectionSuite extends WithKyuubiServer with JDBCTestUt
     }
   }
 
-  test("submit spark app timeout with last log output") {
-    withSessionConf()(Map(KyuubiConf.ENGINE_INIT_TIMEOUT.key -> "2000"))(Map.empty) {
-      val exception = intercept[SQLException] {
-        withJdbcStatement() { statement => // no-op
-        }
-      }
-      val verboseMessage = Utils.stringifyException(exception)
-      assert(verboseMessage.contains("Failed to detect the root cause"))
+  test("sync query causes engine crash") {
+    withSessionHandle { (client, handle) =>
+      val executeStmtReq = new TExecuteStatementReq()
+      executeStmtReq.setStatement("select java_method('java.lang.System', 'exit', 1)")
+      executeStmtReq.setSessionHandle(handle)
+      executeStmtReq.setRunAsync(false)
+      val executeStmtResp = client.ExecuteStatement(executeStmtReq)
+      assert(executeStmtResp.getStatus.getStatusCode === TStatusCode.ERROR_STATUS)
+      assert(executeStmtResp.getOperationHandle === null)
+      assert(executeStmtResp.getStatus.getErrorMessage contains
+        "Caused by: java.net.SocketException: Connection reset")
     }
+  }
+
+  test("test asynchronous open kyuubi session") {
+    withSessionConf(Map(
+      KyuubiConf.SESSION_ENGINE_LAUNCH_ASYNC.key -> "true"))(Map.empty)(Map.empty) {
+      withSessionAndLaunchEngineHandle { (client, handle, launchOpHandleOpt) =>
+        assert(launchOpHandleOpt.isDefined)
+        val launchOpHandle = launchOpHandleOpt.get
+        val executeStmtReq = new TExecuteStatementReq
+        executeStmtReq.setStatement("select engine_name()")
+        executeStmtReq.setSessionHandle(handle)
+        executeStmtReq.setRunAsync(false)
+        val executeStmtResp = client.ExecuteStatement(executeStmtReq)
+        val getOpStatusReq = new TGetOperationStatusReq(executeStmtResp.getOperationHandle)
+        val getOpStatusResp = client.GetOperationStatus(getOpStatusReq)
+        assert(getOpStatusResp.getStatus.getStatusCode === TStatusCode.SUCCESS_STATUS)
+        assert(getOpStatusResp.getOperationState === TOperationState.FINISHED_STATE)
+
+        val launchEngineResp = client.GetOperationStatus(new TGetOperationStatusReq(launchOpHandle))
+        assert(launchEngineResp.getStatus.getStatusCode == TStatusCode.SUCCESS_STATUS)
+        assert(getOpStatusResp.getOperationState === TOperationState.FINISHED_STATE)
+      }
+    }
+  }
+
+  test("test asynchronous open kyuubi session failure") {
+    withSessionConf(Map(
+      KyuubiConf.SESSION_ENGINE_LAUNCH_ASYNC.key -> "true",
+      "spark.master" -> "invalid"))(Map.empty)(Map.empty) {
+      withSessionAndLaunchEngineHandle { (client, handle, launchOpHandleOpt) =>
+        assert(launchOpHandleOpt.isDefined)
+        val launchOpHandle = launchOpHandleOpt.get
+        val executeStmtReq = new TExecuteStatementReq
+        executeStmtReq.setStatement("select engine_name()")
+        executeStmtReq.setSessionHandle(handle)
+        executeStmtReq.setRunAsync(false)
+        val executeStmtResp = client.ExecuteStatement(executeStmtReq)
+        assert(executeStmtResp.getStatus.getStatusCode == TStatusCode.ERROR_STATUS)
+        assert(executeStmtResp.getStatus.getErrorMessage.contains("kyuubi-spark-sql-engine.log"))
+
+        val launchEngineResp = client.GetOperationStatus(new TGetOperationStatusReq(launchOpHandle))
+        assert(launchEngineResp.getStatus.getStatusCode == TStatusCode.SUCCESS_STATUS)
+        assert(launchEngineResp.getOperationState == TOperationState.ERROR_STATE)
+      }
+    }
+  }
+
+  test("open session with KyuubiConnection") {
+    withSessionConf(Map.empty)(Map.empty)(Map(
+      KyuubiConf.SESSION_ENGINE_LAUNCH_ASYNC.key -> "true")) {
+      val driver = new KyuubiHiveDriver()
+      val connection = driver.connect(jdbcUrlWithConf, new Properties())
+
+      val stmt = connection.createStatement()
+      try {
+        stmt.execute("select engine_name()")
+        val resultSet = stmt.getResultSet
+        assert(resultSet.next())
+        assert(resultSet.getString(1).nonEmpty)
+      } finally {
+        stmt.close()
+        connection.close()
+      }
+    }
+
+    withSessionConf(Map.empty)(Map.empty)(Map(
+      KyuubiConf.SESSION_ENGINE_LAUNCH_ASYNC.key -> "false")) {
+      val driver = new KyuubiHiveDriver()
+      val connection = driver.connect(jdbcUrlWithConf, new Properties())
+
+      val stmt = connection.createStatement()
+      try {
+        stmt.execute("select engine_name()")
+        val resultSet = stmt.getResultSet
+        assert(resultSet.next())
+        assert(resultSet.getString(1).nonEmpty)
+      } finally {
+        stmt.close()
+        connection.close()
+      }
+    }
+  }
+
+  test("support to specify OPERATION_LANGUAGE with confOverlay") {
+    withSessionHandle { (client, handle) =>
+      val executeStmtReq = new TExecuteStatementReq()
+      executeStmtReq.setStatement("""spark.sql("SET kyuubi.operation.language").show(false)""")
+      executeStmtReq.setSessionHandle(handle)
+      executeStmtReq.setRunAsync(false)
+      executeStmtReq.setConfOverlay(Map(KyuubiConf.OPERATION_LANGUAGE.key -> "SCALA").asJava)
+      val executeStmtResp = client.ExecuteStatement(executeStmtReq)
+      assert(executeStmtResp.getStatus.getStatusCode == TStatusCode.SUCCESS_STATUS)
+
+      val tFetchResultsReq = new TFetchResultsReq()
+      tFetchResultsReq.setOperationHandle(executeStmtResp.getOperationHandle)
+      tFetchResultsReq.setFetchType(0)
+      tFetchResultsReq.setMaxRows(10)
+      val tFetchResultsResp = client.FetchResults(tFetchResultsReq)
+      val resultSet = tFetchResultsResp.getResults.getColumns.asScala
+      assert(resultSet.size == 1)
+      assert(resultSet.head.getStringVal.getValues.get(0).contains("kyuubi.operation.language"))
+    }
+  }
+
+  test("test session conf plugin") {
+    withSessionConf()(Map())(Map("spark.k1" -> "v0", "spark.k3" -> "v4")) {
+      withJdbcStatement() { statement =>
+        val r1 = statement.executeQuery("set spark.k1")
+        assert(r1.next())
+        assert(r1.getString(2) == "v0")
+
+        val r2 = statement.executeQuery("set spark.k3")
+        assert(r2.next())
+        assert(r2.getString(2) == "v3")
+
+        val r3 = statement.executeQuery("set spark.k4")
+        assert(r3.next())
+        assert(r3.getString(2) == "v4")
+      }
+    }
+  }
+
+  test("close kyuubi connection on launch engine operation failure") {
+    withSessionConf(Map.empty)(Map.empty)(Map(
+      KyuubiConf.SESSION_ENGINE_LAUNCH_ASYNC.key -> "true",
+      "spark.master" -> "invalid")) {
+      val prop = new Properties()
+      prop.setProperty(KyuubiConnection.BEELINE_MODE_PROPERTY, "true")
+      val kyuubiConnection = new KyuubiConnection(jdbcUrlWithConf, prop)
+      intercept[SQLException](kyuubiConnection.waitLaunchEngineToComplete())
+      assert(kyuubiConnection.isClosed)
+    }
+  }
+}
+
+class TestSessionConfAdvisor extends SessionConfAdvisor {
+  override def getConfOverlay(
+      user: String,
+      sessionConf: util.Map[String, String]): util.Map[String, String] = {
+    Map("spark.k3" -> "v3", "spark.k4" -> "v4").asJava
   }
 }

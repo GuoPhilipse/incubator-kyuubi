@@ -19,11 +19,16 @@ package org.apache.kyuubi
 
 import java.io.{File, IOException}
 import java.net.InetAddress
-import java.nio.file.Files
+import java.nio.file.{Files, Paths}
 import java.security.PrivilegedExceptionAction
 import java.util.Properties
 
+import scala.collection.mutable.ArrayBuffer
+
 import org.apache.hadoop.security.UserGroupInformation
+
+import org.apache.kyuubi.config.KyuubiConf
+import org.apache.kyuubi.config.KyuubiConf.SERVER_SECRET_REDACTION_PATTERN
 
 class UtilsSuite extends KyuubiFunSuite {
 
@@ -40,6 +45,8 @@ class UtilsSuite extends KyuubiFunSuite {
     assert(props.getProperty("kyuubi_spark_version") === SPARK_COMPILE_VERSION)
     assert(props.getProperty("kyuubi_hive_version") === HIVE_COMPILE_VERSION)
     assert(props.getProperty("kyuubi_hadoop_version") === HADOOP_COMPILE_VERSION)
+    assert(props.getProperty("kyuubi_flink_version") === FLINK_COMPILE_VERSION)
+    assert(props.getProperty("kyuubi_trino_version") === TRINO_COMPILE_VERSION)
     assert(props.getProperty("branch") === BRANCH)
     assert(props.getProperty("revision") === REVISION)
     assert(props.getProperty("user") === BUILD_USER)
@@ -106,8 +113,7 @@ class UtilsSuite extends KyuubiFunSuite {
         override def run(): Unit = {
           assert(Utils.currentUser === "kentyao")
         }
-      }
-    )
+      })
   }
 
   test("version test") {
@@ -130,5 +136,78 @@ class UtilsSuite extends KyuubiFunSuite {
     } else {
       assert(Utils.findLocalInetAddress !== InetAddress.getLocalHost)
     }
+  }
+
+  test("getAbsolutePathFromWork") {
+    val workDir = System.getenv("KYUUBI_WORK_DIR_ROOT")
+    val path1 = "path1"
+    assert(Utils.getAbsolutePathFromWork(path1).toAbsolutePath.toString ===
+      Paths.get(workDir, path1).toAbsolutePath.toString)
+
+    val path2 = "/tmp/path2"
+    assert(Utils.getAbsolutePathFromWork(path2).toString === path2)
+  }
+
+  test("test args parser") {
+    val args = Array[String]("--conf", "k1=v1", "--conf", " k2 = v2")
+    val conf = new KyuubiConf()
+    Utils.fromCommandLineArgs(args, conf)
+    assert(conf.getOption("k1").get == "v1")
+    assert(conf.getOption("k2").get == "v2")
+
+    val args1 = Array[String]("--conf", "k1=v1", "--conf")
+    val exception1 = intercept[IllegalArgumentException](Utils.fromCommandLineArgs(args1, conf))
+    assert(exception1.getMessage.contains("Illegal size of arguments"))
+
+    val args2 = Array[String]("--conf", "k1=v1", "--conf", "a")
+    val exception2 = intercept[IllegalArgumentException](Utils.fromCommandLineArgs(args2, conf))
+    assert(exception2.getMessage.contains("Illegal argument: a"))
+  }
+
+  test("redact sensitive information in command line args") {
+    val conf = new KyuubiConf()
+    conf.set(SERVER_SECRET_REDACTION_PATTERN, "(?i)secret|password".r)
+
+    val buffer = new ArrayBuffer[String]()
+    buffer += "main"
+    buffer += "--conf"
+    buffer += "kyuubi.my.password=sensitive_value"
+    buffer += "--conf"
+    buffer += "kyuubi.regular.property1=regular_value"
+    buffer += "--conf"
+    buffer += "kyuubi.my.secret=sensitive_value"
+    buffer += "--conf"
+    buffer += "kyuubi.regular.property2=regular_value"
+
+    val commands = buffer.toArray
+
+    // Redact sensitive information
+    val redactedCmdArgs = Utils.redactCommandLineArgs(conf, commands)
+
+    val expectBuffer = new ArrayBuffer[String]()
+    expectBuffer += "main"
+    expectBuffer += "--conf"
+    expectBuffer += "kyuubi.my.password=" + Utils.REDACTION_REPLACEMENT_TEXT
+    expectBuffer += "--conf"
+    expectBuffer += "kyuubi.regular.property1=regular_value"
+    expectBuffer += "--conf"
+    expectBuffer += "kyuubi.my.secret=" + Utils.REDACTION_REPLACEMENT_TEXT
+    expectBuffer += "--conf"
+    expectBuffer += "kyuubi.regular.property2=regular_value"
+
+    assert(expectBuffer.toArray === redactedCmdArgs)
+  }
+
+  test("redact sensitive information") {
+    val secretKeys = Some("my.password".r)
+    assert(Utils.redact(secretKeys, Seq(("kyuubi.my.password", "12345"))) ===
+      Seq(("kyuubi.my.password", Utils.REDACTION_REPLACEMENT_TEXT)))
+    assert(Utils.redact(secretKeys, Seq(("anything", "kyuubi.my.password=12345"))) ===
+      Seq(("anything", Utils.REDACTION_REPLACEMENT_TEXT)))
+    assert(Utils.redact(secretKeys, Seq((999, "kyuubi.my.password=12345"))) ===
+      Seq((999, Utils.REDACTION_REPLACEMENT_TEXT)))
+    // Do not redact when value type is not string
+    assert(Utils.redact(secretKeys, Seq(("my.password", 12345))) ===
+      Seq(("my.password", 12345)))
   }
 }

@@ -17,66 +17,73 @@
 
 package org.apache.kyuubi.engine.spark.events
 
-import org.apache.kyuubi.KyuubiFunSuite
-import org.apache.kyuubi.config.KyuubiConf
-import org.apache.kyuubi.config.KyuubiConf.ENGINE_UI_SESSION_LIMIT
+import org.apache.spark.kyuubi.SparkContextHelper
 
-class EngineEventsStoreSuite extends KyuubiFunSuite {
+import org.apache.kyuubi.engine.spark.WithSparkSQLEngine
+import org.apache.kyuubi.operation.HiveJDBCTestHelper
 
-  test("ensure that the sessions are stored in order") {
-    val store = new EngineEventsStore(KyuubiConf())
+class EngineEventsStoreSuite extends WithSparkSQLEngine with HiveJDBCTestHelper {
 
-    val s1 = SessionEvent("a", "ea", "test1", "1.1.1.1", 1L)
-    val s2 = SessionEvent("c", "ea", "test2", "1.1.1.1", 3L)
-    val s3 = SessionEvent("b", "ea", "test3", "1.1.1.1", 2L)
+  var store: EngineEventsStore = _
 
-    store.saveSession(s1)
-    store.saveSession(s2)
-    store.saveSession(s3)
-
-    assert(store.getSessionList.size == 3)
-    assert(store.getSessionList.head.sessionId == "a")
-    assert(store.getSessionList.last.sessionId == "c")
+  override protected def beforeEach(): Unit = {
+    super.beforeEach()
+    startSparkEngine()
+    val kvStore = SparkContextHelper.getKvStore(spark.sparkContext)
+    store = new EngineEventsStore(kvStore)
   }
 
-  test("test drop sessions when reach the threshold ") {
-    val conf = KyuubiConf()
-    conf.set(ENGINE_UI_SESSION_LIMIT, 3)
+  override protected def afterEach(): Unit = {
+    super.afterEach()
+    stopSparkEngine()
+  }
 
-    val store = new EngineEventsStore(conf)
-    for (i <- 1 to 5) {
-      val s = SessionEvent(s"b$i", "ea", s"test$i", "1.1.1.1", 2L)
-      store.saveSession(s)
+  test("EngineEventsStore session test") {
+    assert(store.getSessionList.isEmpty)
+    assert(store.getSessionCount == 0)
+    withJdbcStatement() { statement =>
+      statement.execute(
+        """
+          |SELECT
+          |  l.id % 100 k,
+          |  sum(l.id) sum,
+          |  count(l.id) cnt,
+          |  avg(l.id) avg,
+          |  min(l.id) min,
+          |  max(l.id) max
+          |from range(0, 100000L, 1, 100) l
+          |  left join range(0, 100000L, 2, 100) r ON l.id = r.id
+          |GROUP BY 1""".stripMargin)
     }
-
-    assert(store.getSessionList.size == 3)
+    assert(store.getSessionList.size == 1)
+    assert(store.getSessionCount == 1)
   }
 
-  test("test drop sessions when reach the threshold, and try to keep active events.") {
-    val conf = KyuubiConf()
-    conf.set(ENGINE_UI_SESSION_LIMIT, 3)
-
-    val store = new EngineEventsStore(conf)
-
-    store.saveSession(SessionEvent("s1", "ea", "test1", "1.1.1.1", 1L, 0L))
-    store.saveSession(SessionEvent("s2", "ea", "test1", "1.1.1.1", 2L, 0L))
-    store.saveSession(SessionEvent("s3", "ea", "test1", "1.1.1.1", 3L, 1L))
-    store.saveSession(SessionEvent("s4", "ea", "test1", "1.1.1.1", 4L, 0L))
-
-    assert(store.getSessionList.size == 3)
-    assert(store.getSessionList(2).sessionId == "s4")
+  test("EngineEventsStore statement test") {
+    assert(store.getStatementList.isEmpty)
+    assert(store.getStatementCount == 0)
+    val sql = """
+                |SELECT
+                |  l.id % 100 k,
+                |  sum(l.id) sum,
+                |  count(l.id) cnt,
+                |  avg(l.id) avg,
+                |  min(l.id) min,
+                |  max(l.id) max
+                |from range(0, 100000L, 1, 100) l
+                |  left join range(0, 100000L, 2, 100) r ON l.id = r.id
+                |GROUP BY 1""".stripMargin
+    withJdbcStatement() { statement =>
+      statement.execute(sql)
+    }
+    val statementList = store.getStatementList
+    assert(statementList.size == 1)
+    assert(store.getStatementCount == 1)
+    val statementId = statementList(0).statementId
+    assert(store.getStatement(statementId).get.statement === sql)
   }
 
-  test("test check session after update session") {
-    val store = new EngineEventsStore(KyuubiConf())
-    val s = SessionEvent("abc", "ea", "test3", "1.1.1.1", 2L)
-    store.saveSession(s)
+  override def withKyuubiConf: Map[String, String] = Map.empty
 
-    val finishTimestamp: Long = 456L
-    s.endTime = finishTimestamp
-    store.saveSession(s)
-
-    assert(store.getSession("abc").get.endTime == finishTimestamp)
-  }
-
+  override protected def jdbcUrl: String = getJdbcUrl
 }

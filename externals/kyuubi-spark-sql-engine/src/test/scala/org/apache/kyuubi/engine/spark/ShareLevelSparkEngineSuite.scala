@@ -19,10 +19,15 @@ package org.apache.kyuubi.engine.spark
 
 import java.util.UUID
 
+import org.scalatest.concurrent.PatienceConfiguration.Timeout
+import org.scalatest.time.SpanSugar.convertIntToGrainOfTime
+
+import org.apache.kyuubi.config.KyuubiConf.ENGINE_CHECK_INTERVAL
 import org.apache.kyuubi.config.KyuubiConf.ENGINE_SHARE_LEVEL
+import org.apache.kyuubi.config.KyuubiConf.ENGINE_SPARK_MAX_LIFETIME
 import org.apache.kyuubi.engine.ShareLevel
 import org.apache.kyuubi.engine.ShareLevel.ShareLevel
-import org.apache.kyuubi.operation.JDBCTestUtils
+import org.apache.kyuubi.operation.HiveJDBCTestHelper
 import org.apache.kyuubi.service.ServiceState
 
 /**
@@ -30,10 +35,13 @@ import org.apache.kyuubi.service.ServiceState
  * e.g. cleanup discovery service before stop.
  */
 abstract class ShareLevelSparkEngineSuite
-  extends WithDiscoverySparkSQLEngine with JDBCTestUtils {
+  extends WithDiscoverySparkSQLEngine with HiveJDBCTestHelper {
   def shareLevel: ShareLevel
   override def withKyuubiConf: Map[String, String] = {
-    super.withKyuubiConf ++ Map(ENGINE_SHARE_LEVEL.key -> shareLevel.toString)
+    super.withKyuubiConf ++ Map(
+      ENGINE_SHARE_LEVEL.key -> shareLevel.toString,
+      ENGINE_SPARK_MAX_LIFETIME.key -> "PT20s",
+      ENGINE_CHECK_INTERVAL.key -> "PT5s")
   }
   override protected def jdbcUrl: String = getJdbcUrl
   override val namespace: String = {
@@ -42,18 +50,37 @@ abstract class ShareLevelSparkEngineSuite
   }
 
   test("check discovery service is clean up with different share level") {
-    withZkClient { zkClient =>
+    withDiscoveryClient { discoveryClient =>
       assert(engine.getServiceState == ServiceState.STARTED)
-      assert(zkClient.checkExists().forPath(namespace) != null)
-      withJdbcStatement() {_ => }
+      assert(discoveryClient.pathExists(namespace))
+      withJdbcStatement() { _ => }
       shareLevel match {
         // Connection level, we will cleanup namespace since it's always a global unique value.
         case ShareLevel.CONNECTION =>
           assert(engine.getServiceState == ServiceState.STOPPED)
-          assert(zkClient.checkExists().forPath(namespace) == null)
+          assert(discoveryClient.pathNonExists(namespace))
         case _ =>
           assert(engine.getServiceState == ServiceState.STARTED)
-          assert(zkClient.checkExists().forPath(namespace) != null)
+          assert(discoveryClient.pathExists(namespace))
+      }
+    }
+  }
+
+  test("test spark engine max life-time") {
+    withDiscoveryClient { discoveryClient =>
+      assert(engine.getServiceState == ServiceState.STARTED)
+      assert(discoveryClient.pathExists(namespace))
+      withJdbcStatement() { _ => }
+
+      eventually(Timeout(30.seconds)) {
+        shareLevel match {
+          case ShareLevel.CONNECTION =>
+            assert(engine.getServiceState == ServiceState.STOPPED)
+            assert(discoveryClient.pathNonExists(namespace))
+          case _ =>
+            assert(engine.getServiceState == ServiceState.STOPPED)
+            assert(discoveryClient.pathExists(namespace))
+        }
       }
     }
   }

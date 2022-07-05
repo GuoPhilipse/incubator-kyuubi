@@ -13,18 +13,16 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 
-.. image:: ../imgs/kyuubi_logo.png
-   :align: center
-
 Kyuubi Security Overview
 ========================
 
+Securing Kyuubi involves enabling authentication(authn), authorization(authz) and encryption, etc.
+
 .. toctree::
     :maxdepth: 2
-    :numbered: 3
 
     Authentication <authentication>
+    Authorization <authorization/index>
     kinit
     hadoop_credentials_manager
-    authorization
 

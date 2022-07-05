@@ -22,10 +22,11 @@ import java.nio.file.{Files, Paths}
 import java.util.concurrent.{ConcurrentHashMap, Future, ThreadPoolExecutor, TimeUnit}
 
 import scala.collection.JavaConverters._
+import scala.concurrent.duration.Duration
 
 import org.apache.hive.service.rpc.thrift.TProtocolVersion
 
-import org.apache.kyuubi.KyuubiSQLException
+import org.apache.kyuubi.{KyuubiSQLException, Utils}
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.config.KyuubiConf._
 import org.apache.kyuubi.operation.OperationManager
@@ -49,10 +50,14 @@ abstract class SessionManager(name: String) extends CompositeService(name) {
 
   private def initOperationLogRootDir(): Unit = {
     try {
-      _operationLogRoot.foreach { logRoot =>
-        val rootPath = Paths.get(logRoot)
-        Files.createDirectories(rootPath)
-      }
+      val logRoot =
+        if (isServer) {
+          conf.get(SERVER_OPERATION_LOG_DIR_ROOT)
+        } else {
+          conf.get(ENGINE_OPERATION_LOG_DIR_ROOT)
+        }
+      val logPath = Files.createDirectories(Utils.getAbsolutePathFromWork(logRoot))
+      _operationLogRoot = Some(logPath.toString)
     } catch {
       case e: IOException =>
         error(s"Failed to initialize operation log root directory: ${_operationLogRoot}", e)
@@ -76,12 +81,39 @@ abstract class SessionManager(name: String) extends CompositeService(name) {
 
   def operationManager: OperationManager
 
+  protected def createSession(
+      protocol: TProtocolVersion,
+      user: String,
+      password: String,
+      ipAddress: String,
+      conf: Map[String, String]): Session
+
   def openSession(
       protocol: TProtocolVersion,
       user: String,
       password: String,
       ipAddress: String,
-      conf: Map[String, String]): SessionHandle
+      conf: Map[String, String]): SessionHandle = {
+    info(s"Opening session for $user@$ipAddress")
+    val session = createSession(protocol, user, password, ipAddress, conf)
+    try {
+      val handle = session.handle
+      session.open()
+      setSession(handle, session)
+      info(s"$user's session with $handle${session.name.map("/" + _).getOrElse("")} is opened," +
+        s" current opening sessions $getOpenSessionCount")
+      handle
+    } catch {
+      case e: Exception =>
+        try {
+          session.close()
+        } catch {
+          case t: Throwable =>
+            warn(s"Error closing session for $user client ip: $ipAddress", t)
+        }
+        throw KyuubiSQLException(e)
+    }
+  }
 
   def closeSession(sessionHandle: SessionHandle): Unit = {
     _latestLogoutTime = System.currentTimeMillis()
@@ -89,23 +121,42 @@ abstract class SessionManager(name: String) extends CompositeService(name) {
     if (session == null) {
       throw KyuubiSQLException(s"Invalid $sessionHandle")
     }
-    info(s"$sessionHandle is closed, current opening sessions $getOpenSessionCount")
-    session.close()
+    info(s"$sessionHandle${session.name.map("/" + _).getOrElse("")} is closed," +
+      s" current opening sessions $getOpenSessionCount")
+    try {
+      session.close()
+    } finally {
+      deleteOperationLogSessionDir(sessionHandle)
+    }
+  }
+
+  private def deleteOperationLogSessionDir(sessionHandle: SessionHandle): Unit = {
+    _operationLogRoot.foreach(logRoot => {
+      val rootPath = Paths.get(logRoot, sessionHandle.identifier.toString)
+      try {
+        Utils.deleteDirectoryRecursively(rootPath.toFile)
+      } catch {
+        case e: IOException =>
+          error(s"Failed to delete session operation log directory ${rootPath.toString}", e)
+      }
+    })
+  }
+
+  def getSessionOption(sessionHandle: SessionHandle): Option[Session] = {
+    Option(handleToSession.get(sessionHandle))
   }
 
   def getSession(sessionHandle: SessionHandle): Session = {
-    val session = handleToSession.get(sessionHandle)
-    if (session == null) {
-      throw KyuubiSQLException(s"Invalid $sessionHandle")
-    }
-    session
+    getSessionOption(sessionHandle).getOrElse(throw KyuubiSQLException(s"Invalid $sessionHandle"))
   }
 
-  protected final def setSession(sessionHandle: SessionHandle, session: Session): Unit = {
+  final protected def setSession(sessionHandle: SessionHandle, session: Session): Unit = {
     handleToSession.put(sessionHandle, session)
   }
 
   def getOpenSessionCount: Int = handleToSession.size()
+
+  def allSessions(): Iterable[Session] = handleToSession.values().asScala
 
   def getExecPoolSize: Int = {
     assert(execPool != null)
@@ -119,31 +170,35 @@ abstract class SessionManager(name: String) extends CompositeService(name) {
 
   private var _confRestrictList: Set[String] = _
   private var _confIgnoreList: Set[String] = _
+  private var _batchConfIgnoreList: Set[String] = _
   private lazy val _confRestrictMatchList: Set[String] =
     _confRestrictList.filter(_.endsWith(".*")).map(_.stripSuffix(".*"))
   private lazy val _confIgnoreMatchList: Set[String] =
     _confIgnoreList.filter(_.endsWith(".*")).map(_.stripSuffix(".*"))
+  private lazy val _batchConfIgnoreMatchList: Set[String] =
+    _batchConfIgnoreList.filter(_.endsWith(".*")).map(_.stripSuffix(".*"))
 
   // strip prefix and validate whether if key is restricted, ignored or valid
   def validateKey(key: String, value: String): Option[(String, String)] = {
-    val normalizedKey = if (key.startsWith(SET_PREFIX)) {
-      val newKey = key.substring(SET_PREFIX.length)
-      if (newKey.startsWith(ENV_PREFIX)) {
-        throw KyuubiSQLException(s"$key is forbidden, env:* variables can not be set.")
-      } else if (newKey.startsWith(SYSTEM_PREFIX)) {
-        newKey.substring(SYSTEM_PREFIX.length)
-      } else if (newKey.startsWith(HIVECONF_PREFIX)) {
-        newKey.substring(HIVECONF_PREFIX.length)
-      } else if (newKey.startsWith(HIVEVAR_PREFIX)) {
-        newKey.substring(HIVEVAR_PREFIX.length)
-      } else if (newKey.startsWith(METACONF_PREFIX)) {
-        newKey.substring(METACONF_PREFIX.length)
+    val normalizedKey =
+      if (key.startsWith(SET_PREFIX)) {
+        val newKey = key.substring(SET_PREFIX.length)
+        if (newKey.startsWith(ENV_PREFIX)) {
+          throw KyuubiSQLException(s"$key is forbidden, env:* variables can not be set.")
+        } else if (newKey.startsWith(SYSTEM_PREFIX)) {
+          newKey.substring(SYSTEM_PREFIX.length)
+        } else if (newKey.startsWith(HIVECONF_PREFIX)) {
+          newKey.substring(HIVECONF_PREFIX.length)
+        } else if (newKey.startsWith(HIVEVAR_PREFIX)) {
+          newKey.substring(HIVEVAR_PREFIX.length)
+        } else if (newKey.startsWith(METACONF_PREFIX)) {
+          newKey.substring(METACONF_PREFIX.length)
+        } else {
+          newKey
+        }
       } else {
-        newKey
+        key
       }
-    } else {
-      key
-    }
 
     if (_confRestrictMatchList.exists(normalizedKey.startsWith(_)) ||
       _confRestrictList.contains(normalizedKey)) {
@@ -159,35 +214,57 @@ abstract class SessionManager(name: String) extends CompositeService(name) {
   }
 
   def validateAndNormalizeConf(config: Map[String, String]): Map[String, String] = config.flatMap {
-    case(k, v) => validateKey(k, v)
+    case (k, v) => validateKey(k, v)
+  }
+
+  // validate whether if a batch key should be ignored
+  def validateBatchKey(key: String, value: String): Option[(String, String)] = {
+    if (_batchConfIgnoreMatchList.exists(key.startsWith(_)) || _batchConfIgnoreList.contains(key)) {
+      warn(s"$key is a ignored batch key according to the server-side configuration")
+      None
+    } else {
+      Some((key, value))
+    }
+  }
+
+  def validateBatchConf(config: Map[String, String]): Map[String, String] = config.flatMap {
+    case (k, v) => validateBatchKey(k, v)
   }
 
   override def initialize(conf: KyuubiConf): Unit = synchronized {
+    this.conf = conf
     addService(operationManager)
     initOperationLogRootDir()
 
-    val poolSize: Int = if (isServer) {
-      conf.get(SERVER_EXEC_POOL_SIZE)
-    } else {
-      conf.get(ENGINE_EXEC_POOL_SIZE)
-    }
+    val poolSize: Int =
+      if (isServer) {
+        conf.get(SERVER_EXEC_POOL_SIZE)
+      } else {
+        conf.get(ENGINE_EXEC_POOL_SIZE)
+      }
 
-    val waitQueueSize: Int = if (isServer) {
-      conf.get(SERVER_EXEC_WAIT_QUEUE_SIZE)
-    } else {
-      conf.get(ENGINE_EXEC_WAIT_QUEUE_SIZE)
-    }
-    val keepAliveMs: Long = if (isServer) {
-      conf.get(SERVER_EXEC_KEEPALIVE_TIME)
-    } else {
-      conf.get(ENGINE_EXEC_KEEPALIVE_TIME)
-    }
+    val waitQueueSize: Int =
+      if (isServer) {
+        conf.get(SERVER_EXEC_WAIT_QUEUE_SIZE)
+      } else {
+        conf.get(ENGINE_EXEC_WAIT_QUEUE_SIZE)
+      }
+    val keepAliveMs: Long =
+      if (isServer) {
+        conf.get(SERVER_EXEC_KEEPALIVE_TIME)
+      } else {
+        conf.get(ENGINE_EXEC_KEEPALIVE_TIME)
+      }
 
     _confRestrictList = conf.get(SESSION_CONF_RESTRICT_LIST).toSet
     _confIgnoreList = conf.get(SESSION_CONF_IGNORE_LIST).toSet
+    _batchConfIgnoreList = conf.get(BATCH_CONF_IGNORE_LIST).toSet
 
     execPool = ThreadUtils.newDaemonQueuedThreadPool(
-      poolSize, waitQueueSize, keepAliveMs, s"$name-exec-pool")
+      poolSize,
+      waitQueueSize,
+      keepAliveMs,
+      s"$name-exec-pool")
     super.initialize(conf)
   }
 
@@ -199,29 +276,15 @@ abstract class SessionManager(name: String) extends CompositeService(name) {
   override def stop(): Unit = synchronized {
     super.stop()
     shutdown = true
-    val shutdownTimeout: Long = if (isServer) {
-      conf.get(ENGINE_EXEC_POOL_SHUTDOWN_TIMEOUT)
-    } else {
-      conf.get(SERVER_EXEC_POOL_SHUTDOWN_TIMEOUT)
-    }
-    timeoutChecker.shutdown()
-    try {
-      timeoutChecker.awaitTermination(shutdownTimeout, TimeUnit.MILLISECONDS)
-    } catch {
-      case i: InterruptedException =>
-        warn(s"Exceeded to shutdown session timeout checker ", i)
-    }
-
-    if (execPool != null) {
-      execPool.shutdown()
-      try {
-        execPool.awaitTermination(shutdownTimeout, TimeUnit.MILLISECONDS)
-      } catch {
-        case e: InterruptedException =>
-          warn(s"Exceeded timeout($shutdownTimeout ms) to wait the exec-pool shutdown gracefully",
-            e)
+    val shutdownTimeout: Long =
+      if (isServer) {
+        conf.get(ENGINE_EXEC_POOL_SHUTDOWN_TIMEOUT)
+      } else {
+        conf.get(SERVER_EXEC_POOL_SHUTDOWN_TIMEOUT)
       }
-    }
+
+    ThreadUtils.shutdown(timeoutChecker, Duration(shutdownTimeout, TimeUnit.MILLISECONDS))
+    ThreadUtils.shutdown(execPool, Duration(shutdownTimeout, TimeUnit.MILLISECONDS))
   }
 
   private def startTimeoutChecker(): Unit = {
@@ -242,7 +305,7 @@ abstract class SessionManager(name: String) extends CompositeService(name) {
                   warn(s"Error closing idle session ${session.handle}", e)
               }
             } else {
-              session.closeExpiredOperations
+              session.closeExpiredOperations()
             }
           }
         }
@@ -252,20 +315,22 @@ abstract class SessionManager(name: String) extends CompositeService(name) {
     timeoutChecker.scheduleWithFixedDelay(checkTask, interval, interval, TimeUnit.MILLISECONDS)
   }
 
-  private[kyuubi] def startTerminatingChecker(): Unit = if (!isServer) {
+  private[kyuubi] def startTerminatingChecker(stop: () => Unit): Unit = if (!isServer) {
     // initialize `_latestLogoutTime` at start
     _latestLogoutTime = System.currentTimeMillis()
     val interval = conf.get(ENGINE_CHECK_INTERVAL)
     val idleTimeout = conf.get(ENGINE_IDLE_TIMEOUT)
-    val checkTask = new Runnable {
-      override def run(): Unit = {
-        if (!shutdown &&
-          System.currentTimeMillis() - latestLogoutTime > idleTimeout && getOpenSessionCount <= 0) {
-          info(s"Idled for more than $idleTimeout ms, terminating")
-          sys.exit(0)
+    if (idleTimeout > 0) {
+      val checkTask = new Runnable {
+        override def run(): Unit = {
+          if (!shutdown && System.currentTimeMillis() - latestLogoutTime > idleTimeout &&
+            getOpenSessionCount <= 0) {
+            info(s"Idled for more than $idleTimeout ms, terminating")
+            stop()
+          }
         }
       }
+      timeoutChecker.scheduleWithFixedDelay(checkTask, interval, interval, TimeUnit.MILLISECONDS)
     }
-    timeoutChecker.scheduleWithFixedDelay(checkTask, interval, interval, TimeUnit.MILLISECONDS)
   }
 }

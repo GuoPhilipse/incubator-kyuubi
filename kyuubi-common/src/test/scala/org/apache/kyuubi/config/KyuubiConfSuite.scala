@@ -58,6 +58,9 @@ class KyuubiConfSuite extends KyuubiFunSuite {
     conf.set(FRONTEND_THRIFT_BINARY_BIND_HOST.key, "kentyao.org")
     assert(conf.get(FRONTEND_THRIFT_BINARY_BIND_HOST).get === "kentyao.org")
 
+    conf.set(FRONTEND_THRIFT_HTTP_BIND_HOST.key, "kentyao.org")
+    assert(conf.get(FRONTEND_THRIFT_HTTP_BIND_HOST).get === "kentyao.org")
+
     conf.setIfMissing(OPERATION_IDLE_TIMEOUT, 60L)
     assert(conf.get(OPERATION_IDLE_TIMEOUT) === 5)
 
@@ -72,6 +75,7 @@ class KyuubiConfSuite extends KyuubiFunSuite {
 
     val map = conf.getAllWithPrefix("kyuubi", "")
     assert(map(FRONTEND_THRIFT_BINARY_BIND_HOST.key.substring(7)) === "kentyao.org")
+    assert(map(FRONTEND_THRIFT_HTTP_BIND_HOST.key.substring(7)) === "kentyao.org")
     val map1 = conf.getAllWithPrefix("kyuubi", "operation")
     assert(map1(OPERATION_IDLE_TIMEOUT.key.substring(7)) === "PT0.005S")
     assert(map1.size === 1)
@@ -92,6 +96,14 @@ class KyuubiConfSuite extends KyuubiFunSuite {
     assert(conf.getUserDefaults("kyuubi").getOption("spark.user.test").get === "a")
     assert(conf.getUserDefaults("userb").getOption("spark.user.test").get === "b")
     assert(conf.getUserDefaults("userc").getOption("spark.user.test").get === "c")
+  }
+
+  test("support arbitrary config from kyuubi-defaults") {
+    val conf = KyuubiConf()
+    assert(conf.getOption("user.name").isEmpty)
+    conf.loadFileDefaults()
+    assert(conf.getOption("abc").get === "xyz")
+    assert(conf.getOption("xyz").get === "abc")
   }
 
   test("time config test") {
@@ -121,7 +133,7 @@ class KyuubiConfSuite extends KyuubiFunSuite {
     kyuubiConf.set(OPERATION_QUERY_TIMEOUT, 1000L)
     assert(kyuubiConf.get(OPERATION_QUERY_TIMEOUT) === Some(1000L))
     kyuubiConf.set(OPERATION_QUERY_TIMEOUT.key, "1000")
-    assert(kyuubiConf.get(OPERATION_QUERY_TIMEOUT) ===  Some(1000L))
+    assert(kyuubiConf.get(OPERATION_QUERY_TIMEOUT) === Some(1000L))
     kyuubiConf.set(OPERATION_QUERY_TIMEOUT.key, "  1000  ")
     assert(kyuubiConf.get(OPERATION_QUERY_TIMEOUT) === Some(1000L))
     kyuubiConf.set(OPERATION_QUERY_TIMEOUT.key, "1000A")
@@ -162,5 +174,13 @@ class KyuubiConfSuite extends KyuubiFunSuite {
     val path = "kyuubi!@#$%^&*()_+-=[]{};:,.<>?"
     kyuubiConf.set(ENGINE_SHARE_LEVEL_SUBDOMAIN.key, path)
     assert(kyuubiConf.get(ENGINE_SHARE_LEVEL_SUBDOMAIN).get == path)
+  }
+
+  test("get pre-defined batch conf for different batch types") {
+    val kyuubiConf = KyuubiConf()
+    kyuubiConf.set(s"$KYUUBI_BATCH_CONF_PREFIX.spark.spark.yarn.tags", "kyuubi")
+    kyuubiConf.set(s"$KYUUBI_BATCH_CONF_PREFIX.flink.yarn.tags", "kyuubi")
+    assert(kyuubiConf.getBatchConf("spark") == Map("spark.yarn.tags" -> "kyuubi"))
+    assert(kyuubiConf.getBatchConf("flink") == Map("yarn.tags" -> "kyuubi"))
   }
 }

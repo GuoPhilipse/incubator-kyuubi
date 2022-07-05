@@ -17,42 +17,29 @@
 
 package org.apache.kyuubi.session
 
-import java.util.Objects
+import java.util.UUID
 
-import org.apache.hive.service.rpc.thrift.{TProtocolVersion, TSessionHandle}
+import org.apache.hive.service.rpc.thrift.TSessionHandle
 
-import org.apache.kyuubi.cli.{Handle, HandleIdentifier}
+import org.apache.kyuubi.cli.Handle
 
-case class SessionHandle(
-    identifier: HandleIdentifier,
-    protocol: TProtocolVersion) extends Handle {
+case class SessionHandle(identifier: UUID) {
 
   def toTSessionHandle: TSessionHandle = {
     val tSessionHandle = new TSessionHandle
-    tSessionHandle.setSessionId(identifier.toTHandleIdentifier)
+    tSessionHandle.setSessionId(Handle.toTHandleIdentifier(identifier))
     tSessionHandle
-  }
-
-  override def hashCode(): Int = Objects.hashCode(identifier) + 31
-
-  override def equals(obj: Any): Boolean = obj match {
-    case SessionHandle(id, _) => Objects.equals(this.identifier, id)
-    case _ => false
   }
 
   override def toString: String = s"SessionHandle [$identifier]"
 }
 
 object SessionHandle {
-  def apply(tHandle: TSessionHandle, protocol: TProtocolVersion): SessionHandle = {
-    apply(HandleIdentifier(tHandle.getSessionId), protocol)
-  }
-
   def apply(tHandle: TSessionHandle): SessionHandle = {
-    apply(tHandle, TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V1)
+    apply(Handle.fromTHandleIdentifier(tHandle.getSessionId))
   }
 
-  def apply(protocol: TProtocolVersion): SessionHandle = {
-    apply(HandleIdentifier(), protocol)
-  }
+  def apply(): SessionHandle = new SessionHandle(UUID.randomUUID())
+
+  def fromUUID(uuid: String): SessionHandle = new SessionHandle(UUID.fromString(uuid))
 }

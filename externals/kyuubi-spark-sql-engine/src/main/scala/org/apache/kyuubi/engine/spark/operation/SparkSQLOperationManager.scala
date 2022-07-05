@@ -22,11 +22,11 @@ import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.JavaConverters._
 
-import org.apache.spark.sql.SparkSession
-
 import org.apache.kyuubi.KyuubiSQLException
-import org.apache.kyuubi.config.KyuubiConf.{OPERATION_INCREMENTAL_COLLECT, OPERATION_PLAN_ONLY, OperationModes}
+import org.apache.kyuubi.config.KyuubiConf._
 import org.apache.kyuubi.config.KyuubiConf.OperationModes._
+import org.apache.kyuubi.engine.spark.repl.KyuubiSparkILoop
+import org.apache.kyuubi.engine.spark.session.SparkSessionImpl
 import org.apache.kyuubi.engine.spark.shim.SparkCatalogShim
 import org.apache.kyuubi.operation.{Operation, OperationManager}
 import org.apache.kyuubi.session.{Session, SessionHandle}
@@ -35,58 +35,82 @@ class SparkSQLOperationManager private (name: String) extends OperationManager(n
 
   def this() = this(classOf[SparkSQLOperationManager].getSimpleName)
 
-  private val sessionToSpark = new ConcurrentHashMap[SessionHandle, SparkSession]()
-
-  private def getSparkSession(sessionHandle: SessionHandle): SparkSession = {
-    val sparkSession = sessionToSpark.get(sessionHandle)
-    if (sparkSession == null) {
-      throw KyuubiSQLException(s"$sessionHandle has not been initialized or already been closed")
-    }
-    sparkSession
-  }
-
-  def setSparkSession(sessionHandle: SessionHandle, spark: SparkSession): Unit = {
-    sessionToSpark.put(sessionHandle, spark)
-  }
-
-  def removeSparkSession(sessionHandle: SessionHandle): SparkSession = {
-    sessionToSpark.remove(sessionHandle)
-  }
-
-  def getOpenSparkSessionCount: Int = sessionToSpark.size()
-
-  private lazy val operationModeDefault = getConf.get(OPERATION_PLAN_ONLY)
+  private lazy val operationModeDefault = getConf.get(OPERATION_PLAN_ONLY_MODE)
   private lazy val operationIncrementalCollectDefault = getConf.get(OPERATION_INCREMENTAL_COLLECT)
+  private lazy val operationLanguageDefault = getConf.get(OPERATION_LANGUAGE)
+  private lazy val operationConvertCatalogDatabaseDefault =
+    getConf.get(ENGINE_OPERATION_CONVERT_CATALOG_DATABASE_ENABLED)
+
+  private val sessionToRepl = new ConcurrentHashMap[SessionHandle, KyuubiSparkILoop]().asScala
+
+  def closeILoop(session: SessionHandle): Unit = {
+    val maybeRepl = sessionToRepl.remove(session)
+    maybeRepl.foreach(_.close())
+  }
 
   override def newExecuteStatementOperation(
       session: Session,
       statement: String,
+      confOverlay: Map[String, String],
       runAsync: Boolean,
       queryTimeout: Long): Operation = {
-    val spark = getSparkSession(session.handle)
-
-    val operationModeStr =
-      spark.conf.get(OPERATION_PLAN_ONLY.key, operationModeDefault).toUpperCase(Locale.ROOT)
-    val incrementalCollect = spark.conf.getOption(OPERATION_INCREMENTAL_COLLECT.key)
-      .map(_.toBoolean).getOrElse(operationIncrementalCollectDefault)
-    val operation = OperationModes.withName(operationModeStr) match {
-      case NONE =>
-        new ExecuteStatement(spark, session, statement, runAsync, queryTimeout, incrementalCollect)
-      case mode =>
-        new PlanOnlyStatement(spark, session, statement, mode)
+    val spark = session.asInstanceOf[SparkSessionImpl].spark
+    if (spark.conf.getOption(ENGINE_OPERATION_CONVERT_CATALOG_DATABASE_ENABLED.key)
+        .map(_.toBoolean).getOrElse(operationConvertCatalogDatabaseDefault)) {
+      val catalogDatabaseOperation = processCatalogDatabase(session, statement, confOverlay)
+      if (catalogDatabaseOperation != null) {
+        return catalogDatabaseOperation
+      }
     }
+    val lang = confOverlay.getOrElse(
+      OPERATION_LANGUAGE.key,
+      spark.conf.get(OPERATION_LANGUAGE.key, operationLanguageDefault))
+    val operation =
+      OperationLanguages.withName(lang.toUpperCase(Locale.ROOT)) match {
+        case OperationLanguages.SQL =>
+          val mode = spark.conf.get(OPERATION_PLAN_ONLY_MODE.key, operationModeDefault)
+          OperationModes.withName(mode.toUpperCase(Locale.ROOT)) match {
+            case NONE =>
+              val incrementalCollect = spark.conf.getOption(OPERATION_INCREMENTAL_COLLECT.key)
+                .map(_.toBoolean).getOrElse(operationIncrementalCollectDefault)
+              new ExecuteStatement(session, statement, runAsync, queryTimeout, incrementalCollect)
+            case mode =>
+              new PlanOnlyStatement(session, statement, mode)
+          }
+        case OperationLanguages.SCALA =>
+          val repl = sessionToRepl.getOrElseUpdate(session.handle, KyuubiSparkILoop(spark))
+          new ExecuteScala(session, repl, statement)
+      }
     addOperation(operation)
   }
 
+  override def newSetCurrentCatalogOperation(session: Session, catalog: String): Operation = {
+    val op = new SetCurrentCatalog(session, catalog)
+    addOperation(op)
+  }
+
+  override def newGetCurrentCatalogOperation(session: Session): Operation = {
+    val op = new GetCurrentCatalog(session)
+    addOperation(op)
+  }
+
+  override def newSetCurrentDatabaseOperation(session: Session, database: String): Operation = {
+    val op = new SetCurrentDatabase(session, database)
+    addOperation(op)
+  }
+
+  override def newGetCurrentDatabaseOperation(session: Session): Operation = {
+    val op = new GetCurrentDatabase(session)
+    addOperation(op)
+  }
+
   override def newGetTypeInfoOperation(session: Session): Operation = {
-    val spark = getSparkSession(session.handle)
-    val op = new GetTypeInfo(spark, session)
+    val op = new GetTypeInfo(session)
     addOperation(op)
   }
 
   override def newGetCatalogsOperation(session: Session): Operation = {
-    val spark = getSparkSession(session.handle)
-    val op = new GetCatalogs(spark, session)
+    val op = new GetCatalogs(session)
     addOperation(op)
   }
 
@@ -94,8 +118,7 @@ class SparkSQLOperationManager private (name: String) extends OperationManager(n
       session: Session,
       catalog: String,
       schema: String): Operation = {
-    val spark = getSparkSession(session.handle)
-    val op = new GetSchemas(spark, session, catalog, schema)
+    val op = new GetSchemas(session, catalog, schema)
     addOperation(op)
   }
 
@@ -105,19 +128,18 @@ class SparkSQLOperationManager private (name: String) extends OperationManager(n
       schemaName: String,
       tableName: String,
       tableTypes: java.util.List[String]): Operation = {
-    val spark = getSparkSession(session.handle)
-    val tTypes = if (tableTypes == null || tableTypes.isEmpty) {
-      SparkCatalogShim.sparkTableTypes
-    } else {
-      tableTypes.asScala.toSet
-    }
-    val op = new GetTables(spark, session, catalogName, schemaName, tableName, tTypes)
+    val tTypes =
+      if (tableTypes == null || tableTypes.isEmpty) {
+        SparkCatalogShim.sparkTableTypes
+      } else {
+        tableTypes.asScala.toSet
+      }
+    val op = new GetTables(session, catalogName, schemaName, tableName, tTypes)
     addOperation(op)
   }
 
   override def newGetTableTypesOperation(session: Session): Operation = {
-    val spark = getSparkSession(session.handle)
-    val op = new GetTableTypes(spark, session)
+    val op = new GetTableTypes(session)
     addOperation(op)
   }
 
@@ -127,8 +149,7 @@ class SparkSQLOperationManager private (name: String) extends OperationManager(n
       schemaName: String,
       tableName: String,
       columnName: String): Operation = {
-    val spark = getSparkSession(session.handle)
-    val op = new GetColumns(spark, session, catalogName, schemaName, tableName, columnName)
+    val op = new GetColumns(session, catalogName, schemaName, tableName, columnName)
     addOperation(op)
   }
 
@@ -137,8 +158,30 @@ class SparkSQLOperationManager private (name: String) extends OperationManager(n
       catalogName: String,
       schemaName: String,
       functionName: String): Operation = {
-    val spark = getSparkSession(session.handle)
-    val op = new GetFunctions(spark, session, catalogName, schemaName, functionName)
+    val op = new GetFunctions(session, catalogName, schemaName, functionName)
     addOperation(op)
+  }
+
+  override def newGetPrimaryKeysOperation(
+      session: Session,
+      catalogName: String,
+      schemaName: String,
+      tableName: String): Operation = {
+    throw KyuubiSQLException.featureNotSupported()
+  }
+
+  override def newGetCrossReferenceOperation(
+      session: Session,
+      primaryCatalog: String,
+      primarySchema: String,
+      primaryTable: String,
+      foreignCatalog: String,
+      foreignSchema: String,
+      foreignTable: String): Operation = {
+    throw KyuubiSQLException.featureNotSupported()
+  }
+
+  override def getQueryId(operation: Operation): String = {
+    throw KyuubiSQLException.featureNotSupported()
   }
 }

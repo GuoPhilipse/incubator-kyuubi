@@ -13,14 +13,13 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 
-.. image:: ../imgs/kyuubi_logo.png
-   :align: center
 
 Client Documentation
 ====================
 
 .. toctree::
     :maxdepth: 2
-    :numbered: 2
 
     hive_jdbc
+    kyuubi_jdbc
+    kerberized_kyuubi

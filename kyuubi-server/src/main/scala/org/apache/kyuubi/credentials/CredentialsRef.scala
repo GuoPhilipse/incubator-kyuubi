@@ -17,17 +17,41 @@
 
 package org.apache.kyuubi.credentials
 
+import java.util.concurrent.atomic.AtomicReference
+
+import scala.concurrent.Future
+import scala.concurrent.duration.Duration
+
 import org.apache.hadoop.security.Credentials
 
 import org.apache.kyuubi.credentials.CredentialsRef.UNSET_EPOCH
-import org.apache.kyuubi.util.KyuubiHadoopUtils
+import org.apache.kyuubi.util.{KyuubiHadoopUtils, ThreadUtils}
 
 class CredentialsRef(appUser: String) {
 
   @volatile
   private var epoch = UNSET_EPOCH
 
+  @volatile
+  private var lastAccessTime: Long = System.currentTimeMillis()
+
   private var encodedCredentials: String = _
+
+  private val credentialFuture = new AtomicReference[Future[Unit]]()
+
+  def setFuture(future: Future[Unit]): Unit = {
+    credentialFuture.set(future)
+  }
+
+  def updateLastAccessTime(): Unit = {
+    lastAccessTime = System.currentTimeMillis()
+  }
+
+  def getLastAccessTime: Long = lastAccessTime
+
+  def getNoOperationTime: Long = {
+    System.currentTimeMillis() - lastAccessTime
+  }
 
   def getEpoch: Long = epoch
 
@@ -40,6 +64,10 @@ class CredentialsRef(appUser: String) {
   def updateCredentials(creds: Credentials): Unit = {
     encodedCredentials = KyuubiHadoopUtils.encodeCredentials(creds)
     epoch += 1
+  }
+
+  def waitUntilReady(timeout: Duration): Unit = {
+    Option(credentialFuture.get).foreach(ThreadUtils.awaitResult(_, timeout))
   }
 
 }

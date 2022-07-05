@@ -17,54 +17,55 @@
 
 package org.apache.kyuubi.engine.spark.operation
 
-import java.util.concurrent.{RejectedExecutionException, ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.RejectedExecutionException
 
 import scala.collection.JavaConverters._
 
-import org.apache.spark.kyuubi.SQLOperationListener
+import org.apache.hive.service.rpc.thrift.TProgressUpdateResp
+import org.apache.spark.kyuubi.{SparkProgressMonitor, SQLOperationListener}
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.types._
 
 import org.apache.kyuubi.{KyuubiSQLException, Logging}
-import org.apache.kyuubi.config.KyuubiConf
-import org.apache.kyuubi.engine.spark.{ArrayFetchIterator, IterableFetchIterator, KyuubiSparkUtil}
-import org.apache.kyuubi.engine.spark.events.{EventLoggingService, SparkStatementEvent}
-import org.apache.kyuubi.operation.{OperationState, OperationType}
+import org.apache.kyuubi.config.KyuubiConf.{OPERATION_RESULT_MAX_ROWS, OPERATION_SPARK_LISTENER_ENABLED, SESSION_PROGRESS_ENABLE}
+import org.apache.kyuubi.engine.spark.KyuubiSparkUtil._
+import org.apache.kyuubi.engine.spark.events.SparkOperationEvent
+import org.apache.kyuubi.events.EventBus
+import org.apache.kyuubi.operation.{ArrayFetchIterator, IterableFetchIterator, OperationState, OperationStatus}
 import org.apache.kyuubi.operation.OperationState.OperationState
 import org.apache.kyuubi.operation.log.OperationLog
 import org.apache.kyuubi.session.Session
-import org.apache.kyuubi.util.ThreadUtils
 
 class ExecuteStatement(
-    spark: SparkSession,
     session: Session,
-    protected override val statement: String,
+    override val statement: String,
     override val shouldRunAsync: Boolean,
     queryTimeout: Long,
     incrementalCollect: Boolean)
-  extends SparkOperation(spark, OperationType.EXECUTE_STATEMENT, session) with Logging {
-
-  import org.apache.kyuubi.KyuubiSparkUtils._
-
-  private val forceCancel =
-    session.sessionManager.getConf.get(KyuubiConf.OPERATION_FORCE_CANCEL)
-
-  private val schedulerPool =
-    spark.conf.getOption(KyuubiConf.OPERATION_SCHEDULER_POOL.key).orElse(
-      session.sessionManager.getConf.get(KyuubiConf.OPERATION_SCHEDULER_POOL))
-
-  private var statementTimeoutCleaner: Option[ScheduledExecutorService] = None
+  extends SparkOperation(session) with Logging {
 
   private val operationLog: OperationLog = OperationLog.createOperationLog(session, getHandle)
   override def getOperationLog: Option[OperationLog] = Option(operationLog)
 
-  private val operationListener: SQLOperationListener = new SQLOperationListener(this, spark)
+  private val operationSparkListenerEnabled =
+    spark.conf.getOption(OPERATION_SPARK_LISTENER_ENABLED.key) match {
+      case Some(s) => s.toBoolean
+      case _ => session.sessionManager.getConf.get(OPERATION_SPARK_LISTENER_ENABLED)
+    }
 
-  val statementEvent: SparkStatementEvent = SparkStatementEvent(
-    statementId, statement, spark.sparkContext.applicationId,
-    session.handle.identifier.toString, lastAccessTime, state.toString, lastAccessTime)
-  EventLoggingService.onEvent(statementEvent)
+  private val operationListener: Option[SQLOperationListener] =
+    if (operationSparkListenerEnabled) {
+      Some(new SQLOperationListener(this, spark))
+    } else {
+      None
+    }
+
+  private val progressEnable = spark.conf.getOption(SESSION_PROGRESS_ENABLE.key) match {
+    case Some(s) => s.toBoolean
+    case _ => session.sessionManager.getConf.get(SESSION_PROGRESS_ENABLE)
+  }
+
+  EventBus.post(SparkOperationEvent(this))
 
   override protected def resultSchema: StructType = {
     if (result == null || result.schema.isEmpty) {
@@ -87,32 +88,36 @@ class ExecuteStatement(
   private def executeStatement(): Unit = withLocalProperties {
     try {
       setState(OperationState.RUNNING)
-      info(KyuubiSparkUtil.diagnostics)
+      info(diagnostics)
       Thread.currentThread().setContextClassLoader(spark.sharedState.jarClassLoader)
-      // TODO: Make it configurable
-      spark.sparkContext.addSparkListener(operationListener)
+      operationListener.foreach(spark.sparkContext.addSparkListener(_))
       result = spark.sql(statement)
-      // TODO #921: COMPILED need consider eagerly executed commands
-      statementEvent.queryExecution = result.queryExecution.toString()
-      setState(OperationState.COMPILED)
-      debug(result.queryExecution)
-      iter = if (incrementalCollect) {
-        info("Execute in incremental collect mode")
-        new IterableFetchIterator[Row](result.toLocalIterator().asScala.toIterable)
-      } else {
-        info("Execute in full collect mode")
-        new ArrayFetchIterator(result.collect())
-      }
+      iter =
+        if (incrementalCollect) {
+          info("Execute in incremental collect mode")
+          new IterableFetchIterator[Row](result.toLocalIterator().asScala.toIterable)
+        } else {
+          val resultMaxRows = spark.conf.getOption(OPERATION_RESULT_MAX_ROWS.key).map(_.toInt)
+            .getOrElse(session.sessionManager.getConf.get(OPERATION_RESULT_MAX_ROWS))
+          if (resultMaxRows <= 0) {
+            info("Execute in full collect mode")
+            new ArrayFetchIterator(result.collect())
+          } else {
+            info(s"Execute with max result rows[$resultMaxRows]")
+            new ArrayFetchIterator(result.take(resultMaxRows))
+          }
+        }
+      setCompiledStateIfNeeded()
       setState(OperationState.FINISHED)
     } catch {
       onError(cancel = true)
     } finally {
-      statementTimeoutCleaner.foreach(_.shutdown())
+      shutdownTimeoutMonitor()
     }
   }
 
   override protected def runInternal(): Unit = {
-    addTimeoutMonitor()
+    addTimeoutMonitor(queryTimeout)
     if (shouldRunAsync) {
       val asyncOperation = new Runnable {
         override def run(): Unit = {
@@ -128,8 +133,8 @@ class ExecuteStatement(
       } catch {
         case rejected: RejectedExecutionException =>
           setState(OperationState.ERROR)
-          val ke = KyuubiSQLException("Error submitting query in background, query rejected",
-            rejected)
+          val ke =
+            KyuubiSQLException("Error submitting query in background, query rejected", rejected)
           setOperationException(ke)
           throw ke
       }
@@ -138,52 +143,51 @@ class ExecuteStatement(
     }
   }
 
-  private def withLocalProperties[T](f: => T): T = {
-    try {
-      spark.sparkContext.setJobGroup(statementId, statement, forceCancel)
-      spark.sparkContext.setLocalProperty(KYUUBI_STATEMENT_ID_KEY, statementId)
-      schedulerPool match {
-        case Some(pool) =>
-          spark.sparkContext.setLocalProperty(SPARK_SCHEDULER_POOL_KEY, pool)
-        case None =>
-      }
-
-      f
-    } finally {
-      spark.sparkContext.setLocalProperty(SPARK_SCHEDULER_POOL_KEY, null)
-      spark.sparkContext.setLocalProperty(KYUUBI_STATEMENT_ID_KEY, null)
-      spark.sparkContext.clearJobGroup()
-    }
-  }
-
-  private def addTimeoutMonitor(): Unit = {
-    if (queryTimeout > 0) {
-      val timeoutExecutor =
-        ThreadUtils.newDaemonSingleThreadScheduledExecutor("query-timeout-thread")
-      timeoutExecutor.schedule(new Runnable {
-        override def run(): Unit = {
-          cleanup(OperationState.TIMEOUT)
-        }
-      }, queryTimeout, TimeUnit.SECONDS)
-      statementTimeoutCleaner = Some(timeoutExecutor)
-    }
-  }
-
   override def cleanup(targetState: OperationState): Unit = {
-    spark.sparkContext.removeSparkListener(operationListener)
+    operationListener.foreach(_.cleanup())
     super.cleanup(targetState)
   }
 
   override def setState(newState: OperationState): Unit = {
     super.setState(newState)
-    statementEvent.state = newState.toString
-    statementEvent.stateTime = lastAccessTime
-    EventLoggingService.onEvent(statementEvent)
+    EventBus.post(
+      SparkOperationEvent(this, operationListener.flatMap(_.getExecutionId)))
   }
 
-  override def setOperationException(opEx: KyuubiSQLException): Unit = {
-    super.setOperationException(opEx)
-    statementEvent.exception = opEx.toString
-    EventLoggingService.onEvent(statementEvent)
+  override def getStatus: OperationStatus = {
+    if (progressEnable) {
+      val progressMonitor = new SparkProgressMonitor(spark, statementId)
+      setOperationJobProgress(new TProgressUpdateResp(
+        progressMonitor.headers,
+        progressMonitor.rows,
+        progressMonitor.progressedPercentage,
+        progressMonitor.executionStatus,
+        progressMonitor.footerSummary,
+        startTime))
+    }
+    super.getStatus
+  }
+
+  def setCompiledStateIfNeeded(): Unit = synchronized {
+    if (getStatus.state == OperationState.RUNNING) {
+      val lastAccessCompiledTime =
+        if (result != null) {
+          val phase = result.queryExecution.tracker.phases
+          if (phase.contains("parsing") && phase.contains("planning")) {
+            val compiledTime = phase("planning").endTimeMs - phase("parsing").startTimeMs
+            lastAccessTime + compiledTime
+          } else {
+            0L
+          }
+        } else {
+          0L
+        }
+      super.setState(OperationState.COMPILED)
+      if (lastAccessCompiledTime > 0L) {
+        lastAccessTime = lastAccessCompiledTime
+      }
+      EventBus.post(
+        SparkOperationEvent(this, operationListener.flatMap(_.getExecutionId)))
+    }
   }
 }

@@ -24,7 +24,7 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.security.Credentials
 import org.scalatest.time.SpanSugar.convertIntToGrainOfTime
 
-import org.apache.kyuubi.KyuubiFunSuite
+import org.apache.kyuubi.{KyuubiException, KyuubiFunSuite}
 import org.apache.kyuubi.config.KyuubiConf
 
 class HadoopCredentialsManagerSuite extends KyuubiFunSuite {
@@ -32,6 +32,16 @@ class HadoopCredentialsManagerSuite extends KyuubiFunSuite {
   private val sessionId = UUID.randomUUID().toString
   private val appUser = "who"
   private val send = (_: String) => {}
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    ExceptionThrowingDelegationTokenProvider.IN_PROVIDER_TEST = true
+  }
+
+  override def afterAll(): Unit = {
+    super.afterAll()
+    ExceptionThrowingDelegationTokenProvider.IN_PROVIDER_TEST = false
+  }
 
   private def withStartedManager(kyuubiConf: KyuubiConf)(f: HadoopCredentialsManager => Unit)
       : Unit = {
@@ -93,6 +103,28 @@ class HadoopCredentialsManagerSuite extends KyuubiFunSuite {
     }
   }
 
+  test("execute credentials renewal task and wait for completion") {
+    val kyuubiConf = new KyuubiConf(false)
+      .set(KyuubiConf.CREDENTIALS_RENEWAL_INTERVAL, 1000L)
+    withStartedManager(kyuubiConf) { manager =>
+      val userRef = manager.getOrCreateUserCredentialsRef(appUser, true)
+      assert(userRef.getEpoch == 0)
+
+      eventually(timeout(1100.milliseconds), interval(100.milliseconds)) {
+        assert(userRef.getEpoch == 1)
+      }
+    }
+  }
+
+  test("throw exception when credential renewal fails") {
+    val kyuubiConf = new KyuubiConf(false)
+      .set(KyuubiConf.CREDENTIALS_RENEWAL_INTERVAL, 1000L)
+    withStartedManager(kyuubiConf) { manager =>
+      UnstableDelegationTokenProvider.throwException = true
+      assertThrows[KyuubiException](manager.getOrCreateUserCredentialsRef(appUser, true))
+    }
+  }
+
   test("schedule credentials renewal retry when failed") {
     val kyuubiConf = new KyuubiConf(false)
       .set(KyuubiConf.CREDENTIALS_RENEWAL_INTERVAL, 1000L)
@@ -111,6 +143,43 @@ class HadoopCredentialsManagerSuite extends KyuubiFunSuite {
       } finally {
         UnstableDelegationTokenProvider.throwException = false
       }
+    }
+  }
+
+  test("expire non-active users'credentials") {
+    val kyuubiConf = new KyuubiConf(false)
+      .set(KyuubiConf.CREDENTIALS_RENEWAL_INTERVAL, 1000L)
+      .set(KyuubiConf.CREDENTIALS_RENEWAL_RETRY_WAIT, 1000L)
+      .set(KyuubiConf.CREDENTIALS_CHECK_INTERVAL, 4000L)
+      .set(KyuubiConf.CREDENTIALS_IDLE_TIMEOUT, 5000L)
+
+    withStartedManager(kyuubiConf) { manager =>
+      // Trigger UserCredentialsRef's initialization
+      val userRef = manager.getOrCreateUserCredentialsRef(appUser)
+      val lastAccessTime = userRef.getLastAccessTime
+      assert(manager.userCredentialsRefMap.size == 1)
+
+      // Last access time is updated
+      Thread.sleep(1000L)
+      manager.sendCredentialsIfNeeded(sessionId, appUser, send)
+      assert(lastAccessTime < userRef.getLastAccessTime)
+
+      // Credentials are expired
+      eventually(timeout(9000.milliseconds), interval(100.milliseconds)) {
+        assert(manager.userCredentialsRefMap.size == 0)
+      }
+
+      // New userRef is created
+      val newUserRef = manager.getOrCreateUserCredentialsRef(appUser)
+      assert(manager.userCredentialsRefMap.size == 1)
+
+      // Old renewal schedule is stopped
+      val epoch = userRef.getEpoch
+      Thread.sleep(2000L)
+      assert(userRef.getEpoch == epoch)
+
+      // New renewal schedule is running
+      assert(newUserRef.getEpoch >= 1)
     }
   }
 
@@ -156,7 +225,9 @@ class HadoopCredentialsManagerSuite extends KyuubiFunSuite {
 
 private class ExceptionThrowingDelegationTokenProvider extends HadoopDelegationTokenProvider {
   ExceptionThrowingDelegationTokenProvider.constructed = true
-  throw new IllegalArgumentException
+  if (ExceptionThrowingDelegationTokenProvider.IN_PROVIDER_TEST) {
+    throw new IllegalArgumentException
+  }
 
   override def serviceName: String = "throw"
 
@@ -170,6 +241,7 @@ private class ExceptionThrowingDelegationTokenProvider extends HadoopDelegationT
 
 private object ExceptionThrowingDelegationTokenProvider {
   var constructed = false
+  var IN_PROVIDER_TEST = false
 }
 
 private class UnRequiredDelegationTokenProvider extends HadoopDelegationTokenProvider {

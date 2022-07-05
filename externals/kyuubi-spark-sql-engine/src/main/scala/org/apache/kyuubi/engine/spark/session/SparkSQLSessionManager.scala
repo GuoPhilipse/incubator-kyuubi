@@ -17,17 +17,19 @@
 
 package org.apache.kyuubi.engine.spark.session
 
+import java.util.concurrent.{ScheduledExecutorService, TimeUnit}
+
 import org.apache.hive.service.rpc.thrift.TProtocolVersion
-import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.SparkSession
 
 import org.apache.kyuubi.KyuubiSQLException
-import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.config.KyuubiConf._
 import org.apache.kyuubi.engine.ShareLevel
-import org.apache.kyuubi.engine.spark.SparkSQLEngine
+import org.apache.kyuubi.engine.ShareLevel._
+import org.apache.kyuubi.engine.spark.{KyuubiSparkUtil, SparkSQLEngine}
 import org.apache.kyuubi.engine.spark.operation.SparkSQLOperationManager
-import org.apache.kyuubi.engine.spark.udf.KDFRegistry
 import org.apache.kyuubi.session._
+import org.apache.kyuubi.util.ThreadUtils
 
 /**
  * A [[SessionManager]] constructed with [[SparkSession]] which give it the ability to talk with
@@ -42,69 +44,132 @@ class SparkSQLSessionManager private (name: String, spark: SparkSession)
 
   def this(spark: SparkSession) = this(classOf[SparkSQLSessionManager].getSimpleName, spark)
 
-  override def initialize(conf: KyuubiConf): Unit = {
-    _operationLogRoot = Some(conf.get(ENGINE_OPERATION_LOG_DIR_ROOT))
-    super.initialize(conf)
-  }
-
   val operationManager = new SparkSQLOperationManager()
 
   private lazy val singleSparkSession = conf.get(ENGINE_SINGLE_SPARK_SESSION)
+  private lazy val shareLevel = ShareLevel.withName(conf.get(ENGINE_SHARE_LEVEL))
 
-  override def openSession(
+  private lazy val userIsolatedSparkSession = conf.get(ENGINE_USER_ISOLATED_SPARK_SESSION)
+  private lazy val userIsolatedIdleInterval =
+    conf.get(ENGINE_USER_ISOLATED_SPARK_SESSION_IDLE_INTERVAL)
+  private lazy val userIsolatedIdleTimeout =
+    conf.get(ENGINE_USER_ISOLATED_SPARK_SESSION_IDLE_TIMEOUT)
+  private val userIsolatedCacheLock = new Object
+  private lazy val userIsolatedCache = new java.util.HashMap[String, SparkSession]()
+  private lazy val userIsolatedCacheCount =
+    new java.util.HashMap[String, (Integer, java.lang.Long)]()
+  private var userIsolatedSparkSessionThread: Option[ScheduledExecutorService] = None
+
+  private def startUserIsolatedCacheChecker(): Unit = {
+    if (!userIsolatedSparkSession) {
+      userIsolatedSparkSessionThread =
+        Some(ThreadUtils.newDaemonSingleThreadScheduledExecutor("user-isolated-cache-checker"))
+      userIsolatedSparkSessionThread.foreach {
+        _.scheduleWithFixedDelay(
+          () => {
+            userIsolatedCacheLock.synchronized {
+              val iter = userIsolatedCacheCount.entrySet().iterator()
+              while (iter.hasNext) {
+                val kv = iter.next()
+                if (kv.getValue._1 == 0 &&
+                  kv.getValue._2 + userIsolatedIdleTimeout < System.currentTimeMillis()) {
+                  userIsolatedCache.remove(kv.getKey)
+                  iter.remove()
+                }
+              }
+            }
+          },
+          userIsolatedIdleInterval,
+          userIsolatedIdleInterval,
+          TimeUnit.MILLISECONDS)
+      }
+    }
+  }
+
+  override def start(): Unit = {
+    startUserIsolatedCacheChecker()
+    super.start()
+  }
+
+  override def stop(): Unit = {
+    super.stop()
+    userIsolatedSparkSessionThread.foreach(_.shutdown())
+  }
+
+  private def getOrNewSparkSession(user: String): SparkSession = {
+    if (singleSparkSession) {
+      spark
+    } else {
+      shareLevel match {
+        // it's unnecessary to create a new spark session in connection share level
+        // since the session is only one
+        case CONNECTION => spark
+        case USER => newSparkSession(spark)
+        case GROUP | SERVER if userIsolatedSparkSession => newSparkSession(spark)
+        case GROUP | SERVER =>
+          userIsolatedCacheLock.synchronized {
+            if (userIsolatedCache.containsKey(user)) {
+              val (count, _) = userIsolatedCacheCount.get(user)
+              userIsolatedCacheCount.put(user, (count + 1, System.currentTimeMillis()))
+              userIsolatedCache.get(user)
+            } else {
+              userIsolatedCacheCount.put(user, (1, System.currentTimeMillis()))
+              val newSession = newSparkSession(spark)
+              userIsolatedCache.put(user, newSession)
+              newSession
+            }
+          }
+      }
+    }
+  }
+
+  private def newSparkSession(rootSparkSession: SparkSession): SparkSession = {
+    val newSparkSession = rootSparkSession.newSession()
+    KyuubiSparkUtil.initializeSparkSession(newSparkSession, conf.get(ENGINE_SESSION_INITIALIZE_SQL))
+    newSparkSession
+  }
+
+  override protected def createSession(
       protocol: TProtocolVersion,
       user: String,
       password: String,
       ipAddress: String,
-      conf: Map[String, String]): SessionHandle = {
-    info(s"Opening session for $user@$ipAddress")
-    val sessionImpl = new SparkSessionImpl(protocol, user, password, ipAddress, conf, this)
-    val handle = sessionImpl.handle
-    try {
-      val sparkSession = if (singleSparkSession) {
-        spark
-      } else {
-        val ss = spark.newSession()
-        this.conf.get(ENGINE_SESSION_INITIALIZE_SQL).foreach { sqlStr =>
-          ss.sparkContext.setJobGroup(handle.identifier.toString, sqlStr, interruptOnCancel = true)
-          ss.sql(sqlStr).isEmpty
-        }
-        ss
+      conf: Map[String, String]): Session = {
+    val clientIp = conf.getOrElse(CLIENT_IP_KEY, ipAddress)
+    val sparkSession =
+      try {
+        getOrNewSparkSession(user)
+      } catch {
+        case e: Exception => throw KyuubiSQLException(e)
       }
 
-      sessionImpl.normalizedConf.foreach {
-        case ("use:database", database) => sparkSession.catalog.setCurrentDatabase(database)
-        case (key, value) => setModifiableConfig(sparkSession, key, value)
-      }
-      sessionImpl.open()
-      KDFRegistry.registerAll(sparkSession)
-      operationManager.setSparkSession(handle, sparkSession)
-      setSession(handle, sessionImpl)
-      info(s"$user's session with $handle is opened, current opening sessions" +
-      s" $getOpenSessionCount")
-      handle
-    } catch {
-      case e: Exception =>
-        sessionImpl.close()
-        throw KyuubiSQLException(e)
-    }
+    new SparkSessionImpl(
+      protocol,
+      user,
+      password,
+      ipAddress,
+      clientIp,
+      conf,
+      this,
+      sparkSession)
   }
 
   override def closeSession(sessionHandle: SessionHandle): Unit = {
+    if (!userIsolatedSparkSession) {
+      val session = getSession(sessionHandle)
+      if (session != null) {
+        userIsolatedCacheLock.synchronized {
+          if (userIsolatedCacheCount.containsKey(session.user)) {
+            val (count, _) = userIsolatedCacheCount.get(session.user)
+            userIsolatedCacheCount.put(session.user, (count - 1, System.currentTimeMillis()))
+          }
+        }
+      }
+    }
     super.closeSession(sessionHandle)
-    operationManager.removeSparkSession(sessionHandle)
-    if (conf.get(ENGINE_SHARE_LEVEL) == ShareLevel.CONNECTION.toString) {
+    if (shareLevel == ShareLevel.CONNECTION) {
       info("Session stopped due to shared level is Connection.")
       stopSession()
-    }
-  }
-
-  private def setModifiableConfig(spark: SparkSession, key: String, value: String): Unit = {
-    try {
-      spark.conf.set(key, value)
-    } catch {
-      case e: AnalysisException =>
-        warn(e.getMessage())
     }
   }
 

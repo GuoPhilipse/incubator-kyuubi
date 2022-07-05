@@ -17,12 +17,15 @@
 
 package org.apache.kyuubi.engine.spark.events
 
-import org.apache.spark.sql.Encoders
-import org.apache.spark.sql.types.StructType
+import com.fasterxml.jackson.annotation.JsonIgnore
+import org.apache.spark.scheduler.SparkListenerEvent
+import org.apache.spark.util.kvstore.KVIndex
 
 import org.apache.kyuubi.Utils
 import org.apache.kyuubi.engine.spark.KyuubiSparkUtil
-import org.apache.kyuubi.session.Session
+import org.apache.kyuubi.engine.spark.KyuubiSparkUtil.KVIndexParam
+import org.apache.kyuubi.engine.spark.session.SparkSessionImpl
+import org.apache.kyuubi.events.KyuubiEvent
 
 /**
  * Event Tracking for user sessions
@@ -31,18 +34,21 @@ import org.apache.kyuubi.session.Session
  * @param startTime Start time
  * @param endTime End time
  * @param ip Client IP address
+ * @param serverIp Kyuubi Server IP address
  * @param totalOperations how many queries and meta calls
  */
 case class SessionEvent(
-    sessionId: String,
+    @KVIndexParam sessionId: String,
+    name: String,
     engineId: String,
     username: String,
     ip: String,
+    serverIp: String,
+    conf: Map[String, String],
     startTime: Long,
     var endTime: Long = -1L,
-    var totalOperations: Int = 0) extends KyuubiSparkEvent {
+    var totalOperations: Int = 0) extends KyuubiEvent with SparkListenerEvent {
 
-  override def schema: StructType = Encoders.product[SessionEvent].schema
   override lazy val partitions: Seq[(String, String)] =
     ("day", Utils.getDateFromTimestamp(startTime)) :: Nil
 
@@ -53,15 +59,21 @@ case class SessionEvent(
       endTime - startTime
     }
   }
+
+  @JsonIgnore @KVIndex("endTime")
+  private def endTimeIndex: Long = if (endTime > 0L) endTime else -1L
 }
 
 object SessionEvent {
-  def apply(session: Session): SessionEvent = {
+  def apply(session: SparkSessionImpl): SessionEvent = {
     new SessionEvent(
       session.handle.identifier.toString,
+      session.name.getOrElse(""),
       KyuubiSparkUtil.engineId,
       session.user,
       session.ipAddress,
+      session.serverIpAddress,
+      session.conf,
       session.createTime)
   }
 }

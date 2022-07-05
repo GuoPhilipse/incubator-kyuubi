@@ -45,13 +45,18 @@ class KinitAuxiliaryService() extends AbstractService("KinitAuxiliaryService") {
 
       require(keytab.nonEmpty && principal.nonEmpty, "principal or keytab is missing")
       UserGroupInformation.loginUserFromKeytab(principal.get, keytab.get)
+      val krb5Conf = Option(System.getProperty("java.security.krb5.conf"))
+        .orElse(Option(System.getenv("KRB5_CONFIG")))
+        .getOrElse("/etc/krb5.conf")
       val commands = Seq("kinit", "-kt", keytab.get, principal.get)
       val kinitProc = new ProcessBuilder(commands: _*).inheritIO()
+      kinitProc.environment().put("KRB5_CONFIG", krb5Conf)
       kinitTask = new Runnable {
         override def run(): Unit = {
           val process = kinitProc.start()
           if (process.waitFor() == 0) {
             info(s"Successfully ${commands.mkString(" ")}")
+            kinitAttempts = 0
             executor.schedule(this, kinitInterval, TimeUnit.MILLISECONDS)
           } else {
             if (kinitAttempts >= kinitMaxAttempts) {
@@ -66,7 +71,6 @@ class KinitAuxiliaryService() extends AbstractService("KinitAuxiliaryService") {
     }
     super.initialize(conf)
   }
-
 
   override def start(): Unit = {
     super.start()

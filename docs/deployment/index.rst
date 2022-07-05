@@ -13,8 +13,6 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 
-.. image:: ../imgs/kyuubi_logo.png
-   :align: center
 
 Deploying Kyuubi
 ================
@@ -26,24 +24,30 @@ Basics
 
 .. toctree::
     :maxdepth: 2
-    :numbered: 3
     :glob:
 
-    on_yarn
-    on_kubernetes
+    kyuubi_on_kubernetes
     hive_metastore
     high_availability_guide
-    metrics
-    logging
-    trouble_shooting
 
 Configurations
 --------------
 
 .. toctree::
     :maxdepth: 2
-    :numbered: 3
     :glob:
 
     settings
+
+Engines
+-------
+
+.. toctree::
+    :maxdepth: 2
+    :glob:
+
+    engine_on_yarn
+    engine_on_kubernetes
+    engine_share_level
+    engine_lifecycle
     spark/index

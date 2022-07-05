@@ -17,24 +17,25 @@
 
 package org.apache.kyuubi.session
 
+import scala.collection.JavaConverters._
+
 import com.codahale.metrics.MetricRegistry
 import org.apache.hive.service.rpc.thrift._
-import org.apache.thrift.TException
-import org.apache.thrift.protocol.TBinaryProtocol
-import org.apache.thrift.transport.{TSocket, TTransport}
 
 import org.apache.kyuubi.KyuubiSQLException
 import org.apache.kyuubi.client.KyuubiSyncThriftClient
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.config.KyuubiConf._
-import org.apache.kyuubi.engine.EngineRef
-import org.apache.kyuubi.events.KyuubiSessionEvent
-import org.apache.kyuubi.ha.client.ZooKeeperClientProvider._
+import org.apache.kyuubi.config.KyuubiReservedKeys.KYUUBI_ENGINE_CREDENTIALS_KEY
+import org.apache.kyuubi.engine.{EngineRef, KyuubiApplicationManager}
+import org.apache.kyuubi.events.{EventBus, KyuubiSessionEvent}
+import org.apache.kyuubi.ha.client.DiscoveryClientProvider._
 import org.apache.kyuubi.metrics.MetricsConstants._
 import org.apache.kyuubi.metrics.MetricsSystem
 import org.apache.kyuubi.operation.{Operation, OperationHandle}
-import org.apache.kyuubi.server.EventLoggingService
-import org.apache.kyuubi.service.authentication.PlainSASLHelper
+import org.apache.kyuubi.operation.log.OperationLog
+import org.apache.kyuubi.service.authentication.InternalSecurityAccessor
+import org.apache.kyuubi.session.SessionType.SessionType
 
 class KyuubiSessionImpl(
     protocol: TProtocolVersion,
@@ -44,81 +45,156 @@ class KyuubiSessionImpl(
     conf: Map[String, String],
     sessionManager: KyuubiSessionManager,
     sessionConf: KyuubiConf)
-  extends AbstractSession(protocol, user, password, ipAddress, conf, sessionManager) {
+  extends KyuubiSession(protocol, user, password, ipAddress, conf, sessionManager) {
+
+  override val sessionType: SessionType = SessionType.SQL
+
+  private[kyuubi] val optimizedConf: Map[String, String] = {
+    val confOverlay = sessionManager.sessionConfAdvisor.getConfOverlay(
+      user,
+      normalizedConf.asJava)
+    if (confOverlay != null) {
+      normalizedConf ++ confOverlay.asScala
+    } else {
+      warn(s"the server plugin return null value for user: $user, ignore it")
+      normalizedConf
+    }
+  }
 
   // TODO: needs improve the hardcode
-  normalizedConf.foreach {
+  optimizedConf.foreach {
     case ("use:database", _) =>
     case ("kyuubi.engine.pool.size.threshold", _) =>
     case (key, value) => sessionConf.set(key, value)
   }
 
-  val engine: EngineRef = new EngineRef(sessionConf, user)
+  private lazy val engineCredentials = renewEngineCredentials()
+
+  lazy val engine: EngineRef =
+    new EngineRef(sessionConf, user, handle.identifier.toString, sessionManager.applicationManager)
+  private[kyuubi] val launchEngineOp = sessionManager.operationManager
+    .newLaunchEngineOperation(this, sessionConf.get(SESSION_ENGINE_LAUNCH_ASYNC))
 
   private val sessionEvent = KyuubiSessionEvent(this)
-  EventLoggingService.onEvent(sessionEvent)
+  EventBus.post(sessionEvent)
 
-  private var transport: TTransport = _
-  private var client: KyuubiSyncThriftClient = _
+  override def getSessionEvent: Option[KyuubiSessionEvent] = {
+    Option(sessionEvent)
+  }
 
-  private var _handle: SessionHandle = _
-  override def handle: SessionHandle = _handle
+  override def checkSessionAccessPathURIs(): Unit = {
+    KyuubiApplicationManager.checkApplicationAccessPaths(
+      sessionConf.get(ENGINE_TYPE),
+      sessionConf.getAll,
+      sessionManager.getConf)
+  }
+
+  private var _client: KyuubiSyncThriftClient = _
+  def client: KyuubiSyncThriftClient = _client
+
+  private var _engineSessionHandle: SessionHandle = _
 
   override def open(): Unit = {
     MetricsSystem.tracing { ms =>
       ms.incCount(CONN_TOTAL)
       ms.incCount(MetricRegistry.name(CONN_OPEN, user))
     }
-    withZkClient(sessionConf) { zkClient =>
-      val (host, port) = engine.getOrCreate(zkClient)
-      openSession(host, port)
-    }
-    // we should call super.open after kyuubi session is already opened
+
+    checkSessionAccessPathURIs()
+
+    // we should call super.open before running launch engine operation
     super.open()
+
+    runOperation(launchEngineOp)
   }
 
-  private def openSession(host: String, port: Int): Unit = {
-    val passwd = Option(password).filter(_.nonEmpty).getOrElse("anonymous")
-    val loginTimeout = sessionConf.get(ENGINE_LOGIN_TIMEOUT).toInt
-    transport = PlainSASLHelper.getPlainTransport(
-      user, passwd, new TSocket(host, port, loginTimeout))
-    if (!transport.isOpen) {
-      transport.open()
-      logSessionInfo(s"Connected to engine [$host:$port]")
+  private[kyuubi] def openEngineSession(extraEngineLog: Option[OperationLog] = None): Unit = {
+    withDiscoveryClient(sessionConf) { discoveryClient =>
+      var openEngineSessionConf = optimizedConf
+      if (engineCredentials.nonEmpty) {
+        sessionConf.set(KYUUBI_ENGINE_CREDENTIALS_KEY, engineCredentials)
+        openEngineSessionConf =
+          optimizedConf ++ Map(KYUUBI_ENGINE_CREDENTIALS_KEY -> engineCredentials)
+      }
+      val (host, port) = engine.getOrCreate(discoveryClient, extraEngineLog)
+      val passwd =
+        if (sessionManager.getConf.get(ENGINE_SECURITY_ENABLED)) {
+          InternalSecurityAccessor.get().issueToken()
+        } else {
+          Option(password).filter(_.nonEmpty).getOrElse("anonymous")
+        }
+      try {
+        _client = KyuubiSyncThriftClient.createClient(user, passwd, host, port, sessionConf)
+        _engineSessionHandle = _client.openSession(protocol, user, passwd, openEngineSessionConf)
+      } catch {
+        case e: Throwable =>
+          error(
+            s"Opening engine [${engine.defaultEngineName} $host:$port]" +
+              s" for $user session failed",
+            e)
+          throw e
+      }
+      logSessionInfo(s"Connected to engine [$host:$port]/[${client.engineId.getOrElse("")}]" +
+        s" with ${_engineSessionHandle}]")
+      sessionEvent.openedTime = System.currentTimeMillis()
+      sessionEvent.remoteSessionId = _engineSessionHandle.identifier.toString
+      _client.engineId.foreach(e => sessionEvent.engineId = e)
+      EventBus.post(sessionEvent)
     }
-    client = new KyuubiSyncThriftClient(new TBinaryProtocol(transport))
-    // use engine SessionHandle directly
-    _handle = client.openSession(protocol, user, passwd, normalizedConf)
-    sessionManager.operationManager.setConnection(handle, client)
-    sessionEvent.openedTime = System.currentTimeMillis()
-    sessionEvent.sessionId = handle.identifier.toString
-    sessionEvent.clientVersion = handle.protocol.getValue
-    EventLoggingService.onEvent(sessionEvent)
   }
 
   override protected def runOperation(operation: Operation): OperationHandle = {
-    sessionEvent.totalOperations += 1
+    if (operation != launchEngineOp) {
+      waitForEngineLaunched()
+      sessionEvent.totalOperations += 1
+    }
     super.runOperation(operation)
+  }
+
+  @volatile private var engineLaunched: Boolean = false
+
+  private def waitForEngineLaunched(): Unit = {
+    if (!engineLaunched) {
+      Option(launchEngineOp).foreach { op =>
+        val waitingStartTime = System.currentTimeMillis()
+        logSessionInfo(s"Starting to wait the launch engine operation finished")
+
+        op.getBackgroundHandle.get()
+
+        val elapsedTime = System.currentTimeMillis() - waitingStartTime
+        logSessionInfo(s"Engine has been launched, elapsed time: ${elapsedTime / 1000} s")
+
+        if (_engineSessionHandle == null) {
+          val ex = op.getStatus.exception.getOrElse(
+            KyuubiSQLException(s"Failed to launch engine for $handle"))
+          throw ex
+        }
+
+        engineLaunched = true
+      }
+    }
+  }
+
+  private def renewEngineCredentials(): String = {
+    try {
+      sessionManager.credentialsManager.renewCredentials(user)
+    } catch {
+      case e: Exception =>
+        error(s"Failed to renew engine credentials for $handle", e)
+        ""
+    }
   }
 
   override def close(): Unit = {
     super.close()
-    if (handle != null) {
-      sessionManager.operationManager.removeConnection(handle)
-      sessionManager.credentialsManager.removeSessionCredentialsEpoch(handle.identifier.toString)
-    }
+    sessionManager.credentialsManager.removeSessionCredentialsEpoch(handle.identifier.toString)
     try {
-      if (client != null) client.closeSession()
-    } catch {
-      case e: TException =>
-        throw KyuubiSQLException("Error while cleaning up the engine resources", e)
+      if (_client != null) _client.closeSession()
     } finally {
+      if (engine != null) engine.close()
       sessionEvent.endTime = System.currentTimeMillis()
-      EventLoggingService.onEvent(sessionEvent)
+      EventBus.post(sessionEvent)
       MetricsSystem.tracing(_.decCount(MetricRegistry.name(CONN_OPEN, user)))
-      if (transport != null && transport.isOpen) {
-        transport.close()
-      }
     }
   }
 }
