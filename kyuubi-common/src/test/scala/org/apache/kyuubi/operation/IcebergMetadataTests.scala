@@ -17,10 +17,15 @@
 
 package org.apache.kyuubi.operation
 
-import org.apache.kyuubi.IcebergSuiteMixin
+import org.apache.kyuubi.{IcebergSuiteMixin, SPARK_COMPILE_VERSION}
+import org.apache.kyuubi.engine.SemanticVersion
 import org.apache.kyuubi.operation.meta.ResultSetSchemaConstant._
 
 trait IcebergMetadataTests extends HiveJDBCTestHelper with IcebergSuiteMixin {
+
+  def isSparkVersionAtLeast(ver: String): Boolean = {
+    SemanticVersion(SPARK_COMPILE_VERSION).isVersionAtLeast(ver)
+  }
 
   test("get catalogs") {
     withJdbcStatement() { statement =>
@@ -151,9 +156,12 @@ trait IcebergMetadataTests extends HiveJDBCTestHelper with IcebergSuiteMixin {
       "map<int, bigint>",
       "date",
       "timestamp",
-      "struct<`X`: bigint, `Y`: double>",
+      // SPARK-37931
+      if (isSparkVersionAtLeast("3.3")) "struct<X: bigint, Y: double>"
+      else "struct<`X`: bigint, `Y`: double>",
       "binary",
-      "struct<`X`: string>")
+      // SPARK-37931
+      if (isSparkVersionAtLeast("3.3")) "struct<X: string>" else "struct<`X`: string>")
     val cols = dataTypes.zipWithIndex.map { case (dt, idx) => s"c$idx" -> dt }
     val (colNames, _) = cols.unzip
 

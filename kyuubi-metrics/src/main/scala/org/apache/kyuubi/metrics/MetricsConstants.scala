@@ -32,6 +32,8 @@ object MetricsConstants {
 
   final private val CONN = KYUUBI + "connection."
   final private val THRIFT_HTTP_CONN = KYUUBI + "thrift.http.connection."
+  final private val THRIFT_BINARY_CONN = KYUUBI + "thrift.binary.connection."
+  final private val REST_CONN = KYUUBI + "rest.connection."
 
   final val CONN_OPEN: String = CONN + "opened"
   final val CONN_FAIL: String = CONN + "failed"
@@ -40,6 +42,14 @@ object MetricsConstants {
   final val THRIFT_HTTP_CONN_OPEN: String = THRIFT_HTTP_CONN + "opened"
   final val THRIFT_HTTP_CONN_FAIL: String = THRIFT_HTTP_CONN + "failed"
   final val THRIFT_HTTP_CONN_TOTAL: String = THRIFT_HTTP_CONN + "total"
+
+  final val THRIFT_BINARY_CONN_OPEN: String = THRIFT_BINARY_CONN + "opened"
+  final val THRIFT_BINARY_CONN_FAIL: String = THRIFT_BINARY_CONN + "failed"
+  final val THRIFT_BINARY_CONN_TOTAL: String = THRIFT_BINARY_CONN + "total"
+
+  final val REST_CONN_OPEN: String = REST_CONN + "opened"
+  final val REST_CONN_FAIL: String = REST_CONN + "failed"
+  final val REST_CONN_TOTAL: String = REST_CONN + "total"
 
   final private val ENGINE = KYUUBI + "engine."
   final val ENGINE_FAIL: String = ENGINE + "failed"
@@ -74,4 +84,8 @@ object MetricsConstants {
   final val BS_GET_RESULT_SET_METADATA = BACKEND_SERVICE + "get_result_set_metadata"
   final val BS_FETCH_RESULTS = BACKEND_SERVICE + "fetch_results"
 
+  final private val METADATA_REQUEST = KYUUBI + "metadata.request."
+  final val METADATA_REQUEST_TOTAL = METADATA_REQUEST + "total"
+  final val METADATA_REQUEST_FAIL = METADATA_REQUEST + "failed"
+  final val METADATA_REQUEST_RETRYING = METADATA_REQUEST + "retrying"
 }

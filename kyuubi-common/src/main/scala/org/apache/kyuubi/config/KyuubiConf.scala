@@ -29,6 +29,7 @@ import scala.util.matching.Regex
 import org.apache.kyuubi.{Logging, Utils}
 import org.apache.kyuubi.config.KyuubiConf._
 import org.apache.kyuubi.engine.{EngineType, ShareLevel}
+import org.apache.kyuubi.operation.{NoneMode, PlainStyle}
 import org.apache.kyuubi.service.authentication.{AuthTypes, SaslQOP}
 
 case class KyuubiConf(loadSysDefault: Boolean = true) extends Logging {
@@ -51,35 +52,49 @@ case class KyuubiConf(loadSysDefault: Boolean = true) extends Logging {
   }
 
   def set[T](entry: ConfigEntry[T], value: T): KyuubiConf = {
-    settings.put(entry.key, entry.strConverter(value))
+    require(entry != null, "entry cannot be null")
+    require(value != null, s"value cannot be null for key: ${entry.key}")
+    require(containsConfigEntry(entry), s"$entry is not registered")
+    if (settings.put(entry.key, entry.strConverter(value)) == null) {
+      logDeprecationWarning(entry.key)
+    }
     this
   }
 
   def set[T](entry: OptionalConfigEntry[T], value: T): KyuubiConf = {
+    require(containsConfigEntry(entry), s"$entry is not registered")
     set(entry.key, entry.strConverter(Option(value)))
     this
   }
 
   def set(key: String, value: String): KyuubiConf = {
-    require(key != null)
-    require(value != null)
-    settings.put(key, value)
+    require(key != null, "key cannot be null")
+    require(value != null, s"value cannot be null for key: $key")
+    if (settings.put(key, value) == null) {
+      logDeprecationWarning(key)
+    }
     this
   }
 
   def setIfMissing[T](entry: ConfigEntry[T], value: T): KyuubiConf = {
-    settings.putIfAbsent(entry.key, entry.strConverter(value))
+    require(containsConfigEntry(entry), s"$entry is not registered")
+    if (settings.putIfAbsent(entry.key, entry.strConverter(value)) == null) {
+      logDeprecationWarning(entry.key)
+    }
     this
   }
 
   def setIfMissing(key: String, value: String): KyuubiConf = {
     require(key != null)
     require(value != null)
-    settings.putIfAbsent(key, value)
+    if (settings.putIfAbsent(key, value) == null) {
+      logDeprecationWarning(key)
+    }
     this
   }
 
   def get[T](config: ConfigEntry[T]): T = {
+    require(containsConfigEntry(config), s"$config is not registered")
     config.readFrom(reader)
   }
 
@@ -87,11 +102,13 @@ case class KyuubiConf(loadSysDefault: Boolean = true) extends Logging {
 
   /** unset a parameter from the configuration */
   def unset(key: String): KyuubiConf = {
+    logDeprecationWarning(key)
     settings.remove(key)
     this
   }
 
   def unset(entry: ConfigEntry[_]): KyuubiConf = {
+    require(containsConfigEntry(entry), s"$entry is not registered")
     unset(entry.key)
   }
 
@@ -131,32 +148,6 @@ case class KyuubiConf(loadSysDefault: Boolean = true) extends Logging {
     cloned
   }
 
-  private val serverOnlyConfEntries: Set[ConfigEntry[_]] = Set(
-    FRONTEND_BIND_HOST,
-    FRONTEND_BIND_PORT,
-    FRONTEND_THRIFT_BINARY_BIND_HOST,
-    FRONTEND_THRIFT_BINARY_BIND_PORT,
-    FRONTEND_THRIFT_HTTP_BIND_HOST,
-    FRONTEND_THRIFT_HTTP_BIND_PORT,
-    FRONTEND_REST_BIND_HOST,
-    FRONTEND_REST_BIND_PORT,
-    FRONTEND_MYSQL_BIND_HOST,
-    FRONTEND_MYSQL_BIND_PORT,
-    AUTHENTICATION_METHOD,
-    KINIT_INTERVAL,
-    SERVER_KEYTAB,
-    SERVER_PRINCIPAL,
-    SERVER_SPNEGO_KEYTAB,
-    SERVER_SPNEGO_PRINCIPAL,
-    SERVER_EVENT_LOGGERS,
-    SERVER_EVENT_JSON_LOG_PATH,
-    SERVER_OPERATION_LOG_DIR_ROOT,
-    SERVER_NAME,
-    SERVER_LIMIT_CONNECTIONS_PER_IPADDRESS,
-    SERVER_LIMIT_CONNECTIONS_PER_USER_IPADDRESS,
-    SERVER_LIMIT_CONNECTIONS_PER_USER,
-    SESSION_LOCAL_DIR_ALLOW_LIST)
-
   def getUserDefaults(user: String): KyuubiConf = {
     val cloned = KyuubiConf(false)
 
@@ -169,6 +160,18 @@ case class KyuubiConf(loadSysDefault: Boolean = true) extends Logging {
     }
     serverOnlyConfEntries.foreach(cloned.unset)
     cloned
+  }
+
+  /**
+   * Logs a warning message if the given config key is deprecated.
+   */
+  private def logDeprecationWarning(key: String): Unit = {
+    KyuubiConf.deprecatedConfigs.get(key).foreach {
+      case DeprecatedConfig(configName, version, comment) =>
+        logger.warn(
+          s"The Kyuubi config '$configName' has been deprecated in Kyuubi v$version " +
+            s"and may be removed in the future. $comment")
+    }
   }
 }
 
@@ -188,14 +191,40 @@ object KyuubiConf {
   final val KYUUBI_ENGINE_ENV_PREFIX = "kyuubi.engineEnv"
   final val KYUUBI_BATCH_CONF_PREFIX = "kyuubi.batchConf"
 
-  val kyuubiConfEntries: java.util.Map[String, ConfigEntry[_]] =
-    java.util.Collections.synchronizedMap(new java.util.HashMap[String, ConfigEntry[_]]())
+  private[this] val kyuubiConfEntriesUpdateLock = new Object
 
-  private def register(entry: ConfigEntry[_]): Unit = kyuubiConfEntries.synchronized {
-    require(
-      !kyuubiConfEntries.containsKey(entry.key),
-      s"Duplicate ConfigEntry. ${entry.key} has been registered")
-    kyuubiConfEntries.put(entry.key, entry)
+  @volatile
+  private[this] var kyuubiConfEntries: java.util.Map[String, ConfigEntry[_]] =
+    java.util.Collections.emptyMap()
+
+  private[config] def register(entry: ConfigEntry[_]): Unit =
+    kyuubiConfEntriesUpdateLock.synchronized {
+      require(
+        !kyuubiConfEntries.containsKey(entry.key),
+        s"Duplicate ConfigEntry. ${entry.key} has been registered")
+      val updatedMap = new java.util.HashMap[String, ConfigEntry[_]](kyuubiConfEntries)
+      updatedMap.put(entry.key, entry)
+      kyuubiConfEntries = updatedMap
+    }
+
+  // For testing only
+  private[config] def unregister(entry: ConfigEntry[_]): Unit =
+    kyuubiConfEntriesUpdateLock.synchronized {
+      val updatedMap = new java.util.HashMap[String, ConfigEntry[_]](kyuubiConfEntries)
+      updatedMap.remove(entry.key)
+      kyuubiConfEntries = updatedMap
+    }
+
+  private[config] def getConfigEntry(key: String): ConfigEntry[_] = {
+    kyuubiConfEntries.get(key)
+  }
+
+  private[config] def getConfigEntries(): java.util.Collection[ConfigEntry[_]] = {
+    kyuubiConfEntries.values()
+  }
+
+  private[config] def containsConfigEntry(entry: ConfigEntry[_]): Boolean = {
+    getConfigEntry(entry.key) == entry
   }
 
   def buildConf(key: String): ConfigBuilder = {
@@ -350,7 +379,7 @@ object KyuubiConf {
       .version("1.4.0")
       .fallbackConf(FRONTEND_BIND_HOST)
 
-  @deprecated(s"using ${FRONTEND_THRIFT_BINARY_BIND_PORT.key} instead", "1.4.0")
+  @deprecated("using kyuubi.frontend.thrift.binary.bind.port instead", "1.4.0")
   val FRONTEND_BIND_PORT: ConfigEntry[Int] = buildConf("kyuubi.frontend.bind.port")
     .doc("(deprecated) Port of the machine on which to run the thrift frontend service " +
       "via binary protocol.")
@@ -423,7 +452,7 @@ object KyuubiConf {
       .version("1.4.0")
       .fallbackConf(FRONTEND_WORKER_KEEPALIVE_TIME)
 
-  @deprecated(s"using ${FRONTEND_THRIFT_MAX_MESSAGE_SIZE.key} instead", "1.4.0")
+  @deprecated("using kyuubi.frontend.thrift.max.message.size instead", "1.4.0")
   val FRONTEND_MAX_MESSAGE_SIZE: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.max.message.size")
       .doc("(deprecated) Maximum message size in bytes a Kyuubi server will accept.")
@@ -437,7 +466,7 @@ object KyuubiConf {
       .version("1.4.0")
       .fallbackConf(FRONTEND_MAX_MESSAGE_SIZE)
 
-  @deprecated(s"using ${FRONTEND_THRIFT_LOGIN_TIMEOUT.key} instead", "1.4.0")
+  @deprecated("using kyuubi.frontend.thrift.login.timeout instead", "1.4.0")
   val FRONTEND_LOGIN_TIMEOUT: ConfigEntry[Long] =
     buildConf("kyuubi.frontend.login.timeout")
       .doc("(deprecated) Timeout for Thrift clients during login to the thrift frontend service.")
@@ -451,7 +480,7 @@ object KyuubiConf {
       .version("1.4.0")
       .fallbackConf(FRONTEND_LOGIN_TIMEOUT)
 
-  @deprecated(s"using ${FRONTEND_THRIFT_LOGIN_BACKOFF_SLOT_LENGTH.key} instead", "1.4.0")
+  @deprecated("using kyuubi.frontend.thrift.backoff.slot.length instead", "1.4.0")
   val FRONTEND_LOGIN_BACKOFF_SLOT_LENGTH: ConfigEntry[Long] =
     buildConf("kyuubi.frontend.backoff.slot.length")
       .doc("(deprecated) Time to back off during login to the thrift frontend service.")
@@ -580,13 +609,27 @@ object KyuubiConf {
       .booleanConf
       .createWithDefault(true)
 
+  val FRONTEND_PROXY_HTTP_CLIENT_IP_HEADER: ConfigEntry[String] =
+    buildConf("kyuubi.frontend.proxy.http.client.ip.header")
+      .doc("The http header to record the real client ip address. If your server is behind a load" +
+        " balancer or other proxy, the server will see this load balancer or proxy IP address as" +
+        " the client IP address, to get around this common issue, most load balancers or proxies" +
+        " offer the ability to record the real remote IP address in an HTTP header that will be" +
+        " added to the request for other devices to use. Note that, because the header value can" +
+        " be specified to any ip address, so it will not be used for authentication.")
+      .version("1.6.0")
+      .stringConf
+      .createWithDefault("X-Real-IP")
+
   val AUTHENTICATION_METHOD: ConfigEntry[Seq[String]] = buildConf("kyuubi.authentication")
     .doc("A comma separated list of client authentication types.<ul>" +
       " <li>NOSASL: raw transport.</li>" +
       " <li>NONE: no authentication check.</li>" +
       " <li>KERBEROS: Kerberos/GSSAPI authentication.</li>" +
       " <li>CUSTOM: User-defined authentication.</li>" +
-      " <li>LDAP: Lightweight Directory Access Protocol authentication.</li></ul>" +
+      " <li>JDBC: JDBC query authentication.</li>" +
+      " <li>LDAP: Lightweight Directory Access Protocol authentication.</li>" +
+      "</ul>" +
       " Note that: For KERBEROS, it is SASL/GSSAPI mechanism," +
       " and for NONE, CUSTOM and LDAP, they are all SASL/PLAIN mechanism." +
       " If only NOSASL is specified, the authentication will be NOSASL." +
@@ -637,6 +680,45 @@ object KyuubiConf {
       .version("1.2.0")
       .stringConf
       .createWithDefault("uid")
+
+  val AUTHENTICATION_JDBC_DRIVER: OptionalConfigEntry[String] =
+    buildConf("kyuubi.authentication.jdbc.driver.class")
+      .doc("Driver class name for JDBC Authentication Provider.")
+      .version("1.6.0")
+      .stringConf
+      .createOptional
+
+  val AUTHENTICATION_JDBC_URL: OptionalConfigEntry[String] =
+    buildConf("kyuubi.authentication.jdbc.url")
+      .doc("JDBC URL for JDBC Authentication Provider.")
+      .version("1.6.0")
+      .stringConf
+      .createOptional
+
+  val AUTHENTICATION_JDBC_USER: OptionalConfigEntry[String] =
+    buildConf("kyuubi.authentication.jdbc.user")
+      .doc("Database user for JDBC Authentication Provider.")
+      .version("1.6.0")
+      .stringConf
+      .createOptional
+
+  val AUTHENTICATION_JDBC_PASSWORD: OptionalConfigEntry[String] =
+    buildConf("kyuubi.authentication.jdbc.password")
+      .doc("Database password for JDBC Authentication Provider.")
+      .version("1.6.0")
+      .stringConf
+      .createOptional
+
+  val AUTHENTICATION_JDBC_QUERY: OptionalConfigEntry[String] =
+    buildConf("kyuubi.authentication.jdbc.query")
+      .doc("Query SQL template with placeholders " +
+        "for JDBC Authentication Provider to execute. " +
+        "Authentication passes if the result set is not empty." +
+        "The SQL statement must start with the `SELECT` clause. " +
+        "Available placeholders are `${user}` and `${password}`.")
+      .version("1.6.0")
+      .stringConf
+      .createOptional
 
   val DELEGATION_KEY_UPDATE_INTERVAL: ConfigEntry[Long] =
     buildConf("kyuubi.delegation.key.update.interval")
@@ -886,7 +968,7 @@ object KyuubiConf {
     .checkValue(_ > Duration.ofSeconds(3).toMillis, "Minimum 3 seconds")
     .createWithDefault(Duration.ofMinutes(5).toMillis)
 
-  @deprecated(s"using ${SESSION_IDLE_TIMEOUT.key} instead", "1.2.0")
+  @deprecated("using kyuubi.session.idle.timeout instead", "1.2.0")
   val SESSION_TIMEOUT: ConfigEntry[Long] = buildConf("kyuubi.session.timeout")
     .doc("(deprecated)session timeout, it will be closed when it's not accessed for this duration")
     .version("1.0.0")
@@ -1199,7 +1281,7 @@ object KyuubiConf {
       .stringConf
       .createWithDefault("server_operation_logs")
 
-  @deprecated(s"using kyuubi.engine.share.level instead", "1.2.0")
+  @deprecated("using kyuubi.engine.share.level instead", "1.2.0")
   val LEGACY_ENGINE_SHARE_LEVEL: ConfigEntry[String] =
     buildConf("kyuubi.session.engine.share.level")
       .doc(s"(deprecated) - Using kyuubi.engine.share.level instead")
@@ -1214,7 +1296,7 @@ object KyuubiConf {
   private val validZookeeperSubPath: Pattern = ("(?!^[\\u002e]{1,2}$)" +
     "(^[\\u0020-\\u002e\\u0030-\\u007e\\u00a0-\\ud7ff\\uf900-\\uffef]{1,}$)").r.pattern
 
-  @deprecated(s"using kyuubi.engine.share.level.subdomain instead", "1.4.0")
+  @deprecated("using kyuubi.engine.share.level.subdomain instead", "1.4.0")
   val ENGINE_SHARE_LEVEL_SUB_DOMAIN: ConfigEntry[Option[String]] =
     buildConf("kyuubi.engine.share.level.sub.domain")
       .doc("(deprecated) - Using kyuubi.engine.share.level.subdomain instead")
@@ -1234,7 +1316,7 @@ object KyuubiConf {
       .version("1.4.0")
       .fallbackConf(ENGINE_SHARE_LEVEL_SUB_DOMAIN)
 
-  @deprecated(s"using ${FRONTEND_CONNECTION_URL_USE_HOSTNAME.key} instead, 1.5.0")
+  @deprecated("using kyuubi.frontend.connection.url.use.hostname instead, 1.5.0")
   val ENGINE_CONNECTION_URL_USE_HOSTNAME: ConfigEntry[Boolean] =
     buildConf("kyuubi.engine.connection.url.use.hostname")
       .doc("(deprecated) " +
@@ -1246,7 +1328,9 @@ object KyuubiConf {
 
   val FRONTEND_CONNECTION_URL_USE_HOSTNAME: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.connection.url.use.hostname")
-      .doc("When true, frontend services prefer hostname, otherwise, ip address")
+      .doc("When true, frontend services prefer hostname, otherwise, ip address. Note that, " +
+        "the default value is set to `false` when engine running on Kubernetes to prevent " +
+        "potential network issue.")
       .version("1.5.0")
       .fallbackConf(ENGINE_CONNECTION_URL_USE_HOSTNAME)
 
@@ -1275,6 +1359,10 @@ object KyuubiConf {
       " all the capacity of the Apache Flink.</li>" +
       " <li>TRINO: specify this engine type will launch a Trino engine which can provide" +
       " all the capacity of the Trino.</li>" +
+      " <li>HIVE_SQL: specify this engine type will launch a Hive engine which can provide" +
+      " all the capacity of the Hive Server2.</li>" +
+      " <li>JDBC: specify this engine type will launch a JDBC engine which can provide" +
+      " a mysql protocol connector, for now we only support Doris dialect.</li>" +
       "</ul>")
     .version("1.4.0")
     .stringConf
@@ -1439,6 +1527,7 @@ object KyuubiConf {
       .checkValue(_.toSet.subsetOf(Set("JSON", "JDBC", "CUSTOM")), "Unsupported event loggers")
       .createWithDefault(Nil)
 
+  @deprecated("using kyuubi.engine.spark.event.loggers instead", "1.6.0")
   val ENGINE_EVENT_LOGGERS: ConfigEntry[Seq[String]] =
     buildConf("kyuubi.engine.event.loggers")
       .doc("A comma separated list of engine history loggers, where engine/session/operation etc" +
@@ -1558,21 +1647,44 @@ object KyuubiConf {
       .stringConf
       .createOptional
 
-  object OperationModes extends Enumeration {
-    type OperationMode = Value
-    val PARSE, ANALYZE, OPTIMIZE, PHYSICAL, EXECUTION, NONE = Value
-  }
-
   val OPERATION_PLAN_ONLY_MODE: ConfigEntry[String] =
     buildConf("kyuubi.operation.plan.only.mode")
-      .doc("Whether to perform the statement in a PARSE, ANALYZE, OPTIMIZE, PHYSICAL, EXECUTION " +
-        "only way without executing the query. When it is NONE, the statement will be fully " +
-        "executed")
+      .doc("Configures the statement performed mode, The value can be 'parse', 'analyze', " +
+        "'optimize', 'optimize_with_stats', 'physical', 'execution', or 'none', " +
+        "when it is 'none', indicate to the statement will be fully executed, otherwise " +
+        "only way without executing the query. different engines currently support different " +
+        "modes, the Spark engine supports all modes, and the Flink engine supports 'parse', " +
+        "'physical', and 'execution', other engines do not support planOnly currently.")
       .version("1.4.0")
       .stringConf
       .transform(_.toUpperCase(Locale.ROOT))
-      .checkValues(OperationModes.values.map(_.toString))
-      .createWithDefault(OperationModes.NONE.toString)
+      .checkValue(
+        mode =>
+          Set(
+            "PARSE",
+            "ANALYZE",
+            "OPTIMIZE",
+            "OPTIMIZE_WITH_STATS",
+            "PHYSICAL",
+            "EXECUTION",
+            "NONE").contains(mode),
+        "Invalid value for 'kyuubi.operation.plan.only.mode'. Valid values are" +
+          "'parse', 'analyze', 'optimize', 'optimize_with_stats', 'physical', 'execution' and " +
+          "'none'.")
+      .createWithDefault(NoneMode.name)
+
+  val OPERATION_PLAN_ONLY_OUT_STYLE: ConfigEntry[String] =
+    buildConf("kyuubi.operation.plan.only.output.style")
+      .doc("Configures the planOnly output style, The value can be 'plain' and 'json', default " +
+        "value is 'plain', this configuration supports only the output styles of the Spark engine")
+      .version("1.7.0")
+      .stringConf
+      .transform(_.toUpperCase(Locale.ROOT))
+      .checkValue(
+        mode => Set("PLAIN", "JSON").contains(mode),
+        "Invalid value for 'kyuubi.operation.plan.only.output.style'. Valid values are " +
+          "'plain', 'json'.")
+      .createWithDefault(PlainStyle.name)
 
   val OPERATION_PLAN_ONLY_EXCLUDES: ConfigEntry[Seq[String]] =
     buildConf("kyuubi.operation.plan.only.excludes")
@@ -1592,9 +1704,18 @@ object KyuubiConf {
         "UseStatement",
         "SetCatalogAndNamespace"))
 
-  object OperationLanguages extends Enumeration {
+  object OperationLanguages extends Enumeration with Logging {
     type OperationLanguage = Value
-    val SQL, SCALA = Value
+    val SQL, SCALA, UNKNOWN = Value
+    def apply(language: String): OperationLanguage = {
+      language.toUpperCase(Locale.ROOT) match {
+        case "SQL" => SQL
+        case "SCALA" => SCALA
+        case other =>
+          warn(s"Unsupported operation language: $language, using UNKNOWN instead")
+          UNKNOWN
+      }
+    }
   }
 
   val OPERATION_LANGUAGE: ConfigEntry[String] =
@@ -1624,6 +1745,16 @@ object KyuubiConf {
       .version("1.5.0")
       .stringConf
       .createOptional
+
+  val SERVER_INFO_PROVIDER: ConfigEntry[String] =
+    buildConf("kyuubi.server.info.provider")
+      .doc("The server information provider name, some clients may rely on this information" +
+        " to check the server compatibilities and functionalities." +
+        " <li>SERVER: Return Kyuubi server information.</li>" +
+        " <li>ENGINE: Return Kyuubi engine information.</li>")
+      .version("1.6.1")
+      .stringConf
+      .createWithDefault("ENGINE")
 
   val ENGINE_SPARK_SHOW_PROGRESS: ConfigEntry[Boolean] =
     buildConf("kyuubi.session.engine.spark.showProgress")
@@ -1826,4 +1957,191 @@ object KyuubiConf {
       .version("1.6.0")
       .stringConf
       .createOptional
+
+  private val serverOnlyConfEntries: Set[ConfigEntry[_]] = Set(
+    FRONTEND_BIND_HOST,
+    FRONTEND_BIND_PORT,
+    FRONTEND_THRIFT_BINARY_BIND_HOST,
+    FRONTEND_THRIFT_BINARY_BIND_PORT,
+    FRONTEND_THRIFT_HTTP_BIND_HOST,
+    FRONTEND_THRIFT_HTTP_BIND_PORT,
+    FRONTEND_REST_BIND_HOST,
+    FRONTEND_REST_BIND_PORT,
+    FRONTEND_MYSQL_BIND_HOST,
+    FRONTEND_MYSQL_BIND_PORT,
+    AUTHENTICATION_METHOD,
+    KINIT_INTERVAL,
+    SERVER_KEYTAB,
+    SERVER_PRINCIPAL,
+    SERVER_SPNEGO_KEYTAB,
+    SERVER_SPNEGO_PRINCIPAL,
+    SERVER_EVENT_LOGGERS,
+    SERVER_EVENT_JSON_LOG_PATH,
+    SERVER_OPERATION_LOG_DIR_ROOT,
+    SERVER_NAME,
+    SERVER_LIMIT_CONNECTIONS_PER_IPADDRESS,
+    SERVER_LIMIT_CONNECTIONS_PER_USER_IPADDRESS,
+    SERVER_LIMIT_CONNECTIONS_PER_USER,
+    SESSION_LOCAL_DIR_ALLOW_LIST)
+
+  /**
+   * Holds information about keys that have been deprecated.
+   *
+   * @param key The deprecated key.
+   * @param version Version of Kyuubi where key was deprecated.
+   * @param comment Additional info regarding to the removed config. For example,
+   *                reasons of config deprecation, what users should use instead of it.
+   */
+  case class DeprecatedConfig(key: String, version: String, comment: String)
+
+  private val deprecatedConfigs: Map[String, DeprecatedConfig] = {
+    val configs = Seq(
+      DeprecatedConfig(
+        FRONTEND_BIND_PORT.key,
+        "1.4.0",
+        s"Use ${FRONTEND_THRIFT_BINARY_BIND_PORT.key} instead"),
+      DeprecatedConfig(
+        FRONTEND_MAX_MESSAGE_SIZE.key,
+        "1.4.0",
+        s"Use ${FRONTEND_THRIFT_MAX_MESSAGE_SIZE.key} instead"),
+      DeprecatedConfig(
+        FRONTEND_LOGIN_TIMEOUT.key,
+        "1.4.0",
+        s"Use ${FRONTEND_THRIFT_LOGIN_TIMEOUT.key} instead"),
+      DeprecatedConfig(
+        FRONTEND_LOGIN_BACKOFF_SLOT_LENGTH.key,
+        "1.4.0",
+        s"Use ${FRONTEND_THRIFT_LOGIN_BACKOFF_SLOT_LENGTH.key} instead"),
+      DeprecatedConfig(
+        SESSION_TIMEOUT.key,
+        "1.2.0",
+        s"Use ${SESSION_IDLE_TIMEOUT.key} instead"),
+      DeprecatedConfig(
+        LEGACY_ENGINE_SHARE_LEVEL.key,
+        "1.2.0",
+        s"Use ${ENGINE_SHARE_LEVEL.key} instead"),
+      DeprecatedConfig(
+        ENGINE_SHARE_LEVEL_SUB_DOMAIN.key,
+        "1.4.0",
+        s"Use ${ENGINE_SHARE_LEVEL_SUBDOMAIN.key} instead"),
+      DeprecatedConfig(
+        ENGINE_CONNECTION_URL_USE_HOSTNAME.key,
+        "1.5.0",
+        s"Use ${FRONTEND_CONNECTION_URL_USE_HOSTNAME.key} instead"),
+
+      // deprected configs of [[org.apache.kyuubi.zookeeper.ZookeeperConf]]
+      DeprecatedConfig(
+        "kyuubi.zookeeper.embedded.port",
+        "1.2.0",
+        "Use kyuubi.zookeeper.embedded.client.port instead"),
+      DeprecatedConfig(
+        "kyuubi.zookeeper.embedded.directory",
+        "1.2.0",
+        "Use kyuubi.zookeeper.embedded.data.dir instead"),
+
+      // deprected configs of [[org.apache.kyuubi.ha.HighAvailabilityConf]]
+      DeprecatedConfig(
+        "kyuubi.ha.zookeeper.quorum",
+        "1.6.0",
+        "Use kyuubi.ha.addresses instead"),
+      DeprecatedConfig(
+        "kyuubi.ha.zookeeper.namespace",
+        "1.6.0",
+        "Use kyuubi.ha.namespace instead"),
+      DeprecatedConfig(
+        "kyuubi.ha.zookeeper.acl.enabled",
+        "1.3.2",
+        "Use kyuubi.ha.zookeeper.auth.type and kyuubi.ha.zookeeper.engine.auth.type instead"))
+    Map(configs.map { cfg => cfg.key -> cfg }: _*)
+  }
+
+  val ENGINE_JDBC_MEMORY: ConfigEntry[String] =
+    buildConf("kyuubi.engine.jdbc.memory")
+      .doc("The heap memory for the jdbc query engine")
+      .version("1.6.0")
+      .stringConf
+      .createWithDefault("1g")
+
+  val ENGINE_JDBC_JAVA_OPTIONS: OptionalConfigEntry[String] =
+    buildConf("kyuubi.engine.jdbc.java.options")
+      .doc("The extra java options for the jdbc query engine")
+      .version("1.6.0")
+      .stringConf
+      .createOptional
+
+  val ENGINE_JDBC_EXTRA_CLASSPATH: OptionalConfigEntry[String] =
+    buildConf("kyuubi.engine.jdbc.extra.classpath")
+      .doc("The extra classpath for the jdbc query engine, for configuring location" +
+        " of jdbc driver, etc")
+      .version("1.6.0")
+      .stringConf
+      .createOptional
+
+  val ENGINE_SPARK_EVENT_LOGGERS: ConfigEntry[Seq[String]] =
+    buildConf("kyuubi.engine.spark.event.loggers")
+      .doc("A comma separated list of engine loggers, where engine/session/operation etc" +
+        " events go. We use spark logger by default.<ul>" +
+        " <li>SPARK: the events will be written to the spark listener bus.</li>" +
+        " <li>JSON: the events will be written to the location of" +
+        s" ${ENGINE_EVENT_JSON_LOG_PATH.key}</li>" +
+        " <li>JDBC: to be done</li>" +
+        " <li>CUSTOM: to be done.</li></ul>")
+      .version("1.7.0")
+      .fallbackConf(ENGINE_EVENT_LOGGERS)
+
+  val ENGINE_HIVE_EVENT_LOGGERS: ConfigEntry[Seq[String]] =
+    buildConf("kyuubi.engine.hive.event.loggers")
+      .doc("A comma separated list of engine history loggers, where engine/session/operation etc" +
+        " events go. We use spark logger by default.<ul>" +
+        " <li>JSON: the events will be written to the location of" +
+        s" ${ENGINE_EVENT_JSON_LOG_PATH.key}</li>" +
+        " <li>JDBC: to be done</li>" +
+        " <li>CUSTOM: to be done.</li></ul>")
+      .version("1.7.0")
+      .stringConf
+      .transform(_.toUpperCase(Locale.ROOT))
+      .toSequence()
+      .checkValue(
+        _.toSet.subsetOf(Set("JSON", "JDBC", "CUSTOM")),
+        "Unsupported event loggers")
+      .createWithDefault(Seq("JSON"))
+
+  val ENGINE_TRINO_EVENT_LOGGERS: ConfigEntry[Seq[String]] =
+    buildConf("kyuubi.engine.trino.event.loggers")
+      .doc("A comma separated list of engine history loggers, where engine/session/operation etc" +
+        " events go. We use spark logger by default.<ul>" +
+        " <li>JSON: the events will be written to the location of" +
+        s" ${ENGINE_EVENT_JSON_LOG_PATH.key}</li>" +
+        " <li>JDBC: to be done</li>" +
+        " <li>CUSTOM: to be done.</li></ul>")
+      .version("1.7.0")
+      .stringConf
+      .transform(_.toUpperCase(Locale.ROOT))
+      .toSequence()
+      .checkValue(
+        _.toSet.subsetOf(Set("JSON", "JDBC", "CUSTOM")),
+        "Unsupported event loggers")
+      .createWithDefault(Seq("JSON"))
+
+  val ASYNC_EVENT_HANDLER_POLL_SIZE: ConfigEntry[Int] =
+    buildConf("kyuubi.event.async.pool.size")
+      .doc("Number of threads in the async event handler thread pool")
+      .version("1.7.0")
+      .intConf
+      .createWithDefault(8)
+
+  val ASYNC_EVENT_HANDLER_WAIT_QUEUE_SIZE: ConfigEntry[Int] =
+    buildConf("kyuubi.event.async.pool.wait.queue.size")
+      .doc("Size of the wait queue for the async event handler thread pool")
+      .version("1.7.0")
+      .intConf
+      .createWithDefault(100)
+
+  val ASYNC_EVENT_HANDLER_KEEPALIVE_TIME: ConfigEntry[Long] =
+    buildConf("kyuubi.event.async.pool.keepalive.time")
+      .doc("Time(ms) that an idle async thread of the async event handler thread pool will wait" +
+        " for a new task to arrive before terminating")
+      .version("1.7.0")
+      .timeConf
+      .createWithDefault(Duration.ofSeconds(60).toMillis)
 }

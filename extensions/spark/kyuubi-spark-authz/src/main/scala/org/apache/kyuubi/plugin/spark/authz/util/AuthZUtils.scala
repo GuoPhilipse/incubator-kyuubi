@@ -20,10 +20,11 @@ package org.apache.kyuubi.plugin.spark.authz.util
 import scala.util.{Failure, Success, Try}
 
 import org.apache.hadoop.security.UserGroupInformation
-import org.apache.spark.SPARK_VERSION
-import org.apache.spark.SparkContext
+import org.apache.spark.{SPARK_VERSION, SparkContext}
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, View}
+import org.apache.spark.sql.connector.catalog.Identifier
 
 private[authz] object AuthZUtils {
 
@@ -43,12 +44,24 @@ private[authz] object AuthZUtils {
     }
   }
 
+  def getFieldValOpt[T](o: Any, name: String): Option[T] = Try(getFieldVal[T](o, name)).toOption
+
   def invoke(
       obj: AnyRef,
       methodName: String,
       args: (Class[_], AnyRef)*): AnyRef = {
     val (types, values) = args.unzip
-    val method = obj.getClass.getDeclaredMethod(methodName, types: _*)
+    val method = obj.getClass.getMethod(methodName, types: _*)
+    method.setAccessible(true)
+    method.invoke(obj, values: _*)
+  }
+
+  def invokeStatic(
+      obj: Class[_],
+      methodName: String,
+      args: (Class[_], AnyRef)*): AnyRef = {
+    val (types, values) = args.unzip
+    val method = obj.getMethod(methodName, types: _*)
     method.setAccessible(true)
     method.invoke(obj, values: _*)
   }
@@ -84,58 +97,61 @@ private[authz] object AuthZUtils {
     getFieldVal[Option[CatalogTable]](plan, "catalogTable")
   }
 
-  /**
-   * Given a Kyuubi/Spark/Hive version string,
-   * return the (major version number, minor version number).
-   * E.g., for 2.0.1-SNAPSHOT, return (2, 0).
-   */
-  def majorMinorVersion(version: String): (Int, Int) = {
-    """^(\d+)\.(\d+)(\..*)?$""".r.findFirstMatchIn(version) match {
-      case Some(m) =>
-        (m.group(1).toInt, m.group(2).toInt)
-      case None =>
-        throw new IllegalArgumentException(s"Tried to parse '$version' as a project" +
-          s" version string, but it could not find the major and minor version numbers.")
+  def hasResolvedDatasourceV2Table(plan: LogicalPlan): Boolean = {
+    plan.nodeName == "DataSourceV2Relation" && plan.resolved
+  }
+
+  def getDatasourceV2Identifier(plan: LogicalPlan): Option[Identifier] = {
+    getFieldVal[Option[Identifier]](plan, "identifier")
+  }
+
+  def getTableIdentifierFromV2Identifier(id: Identifier): TableIdentifier = {
+    TableIdentifier(id.name(), Some(quote(id.namespace())))
+  }
+
+  def hasResolvedPermanentView(plan: LogicalPlan): Boolean = {
+    plan match {
+      case view: View if view.resolved && isSparkVersionAtLeast("3.1.0") =>
+        !getFieldVal[Boolean](view, "isTempView")
+      case _ =>
+        false
     }
   }
 
-  /**
-   * Given a Kyuubi/Spark/Hive version string, return the major version number.
-   * E.g., for 2.0.1-SNAPSHOT, return 2.
-   */
-  def majorVersion(version: String): Int = majorMinorVersion(version)._1
+  def isSparkVersionAtMost(targetVersionString: String): Boolean = {
+    SemanticVersion(SPARK_VERSION).isVersionAtMost(targetVersionString)
+  }
+
+  def isSparkVersionAtLeast(targetVersionString: String): Boolean = {
+    SemanticVersion(SPARK_VERSION).isVersionAtLeast(targetVersionString)
+  }
+
+  def isSparkVersionEqualTo(targetVersionString: String): Boolean = {
+    SemanticVersion(SPARK_VERSION).isVersionEqualTo(targetVersionString)
+  }
 
   /**
-   * Given a Kyuubi/Spark/Hive version string, return the minor version number.
-   * E.g., for 2.0.1-SNAPSHOT, return 0.
+   * check if spark version satisfied
+   * first param is option of supported most  spark version,
+   * and secont param is option of supported least spark version
+   *
+   * @return
    */
-  def minorVersion(version: String): Int = majorMinorVersion(version)._2
+  def passSparkVersionCheck: (Option[String], Option[String]) => Boolean =
+    (mostSparkVersion, leastSparkVersion) => {
+      mostSparkVersion.forall(isSparkVersionAtMost) &&
+      leastSparkVersion.forall(isSparkVersionAtLeast)
+    }
 
-  def isSparkVersionAtMost(ver: String): Boolean = {
-    val runtimeMajor = majorVersion(SPARK_VERSION)
-    val targetMajor = majorVersion(ver)
-    (runtimeMajor < targetMajor) || {
-      val runtimeMinor = minorVersion(SPARK_VERSION)
-      val targetMinor = minorVersion(ver)
-      runtimeMajor == targetMajor && runtimeMinor <= targetMinor
+  def quoteIfNeeded(part: String): String = {
+    if (part.matches("[a-zA-Z0-9_]+") && !part.matches("\\d+")) {
+      part
+    } else {
+      s"`${part.replace("`", "``")}`"
     }
   }
 
-  def isSparkVersionAtLeast(ver: String): Boolean = {
-    val runtimeMajor = majorVersion(SPARK_VERSION)
-    val targetMajor = majorVersion(ver)
-    (runtimeMajor > targetMajor) || {
-      val runtimeMinor = minorVersion(SPARK_VERSION)
-      val targetMinor = minorVersion(ver)
-      runtimeMajor == targetMajor && runtimeMinor >= targetMinor
-    }
-  }
-
-  def isSparkVersionEqualTo(ver: String): Boolean = {
-    val runtimeMajor = majorVersion(SPARK_VERSION)
-    val targetMajor = majorVersion(ver)
-    val runtimeMinor = minorVersion(SPARK_VERSION)
-    val targetMinor = minorVersion(ver)
-    runtimeMajor == targetMajor && runtimeMinor == targetMinor
+  def quote(parts: Seq[String]): String = {
+    parts.map(quoteIfNeeded).mkString(".")
   }
 }

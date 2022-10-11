@@ -63,6 +63,7 @@ class KyuubiSessionImpl(
 
   // TODO: needs improve the hardcode
   optimizedConf.foreach {
+    case ("use:catalog", _) =>
     case ("use:database", _) =>
     case ("kyuubi.engine.pool.size.threshold", _) =>
     case (key, value) => sessionConf.set(key, value)
@@ -177,7 +178,7 @@ class KyuubiSessionImpl(
 
   private def renewEngineCredentials(): String = {
     try {
-      sessionManager.credentialsManager.renewCredentials(user)
+      sessionManager.credentialsManager.renewCredentials(engine.appUser)
     } catch {
       case e: Exception =>
         error(s"Failed to renew engine credentials for $handle", e)
@@ -195,6 +196,17 @@ class KyuubiSessionImpl(
       sessionEvent.endTime = System.currentTimeMillis()
       EventBus.post(sessionEvent)
       MetricsSystem.tracing(_.decCount(MetricRegistry.name(CONN_OPEN, user)))
+    }
+  }
+
+  override def getInfo(infoType: TGetInfoType): TGetInfoValue = {
+    sessionConf.get(SERVER_INFO_PROVIDER) match {
+      case "SERVER" => super.getInfo(infoType)
+      case "ENGINE" => withAcquireRelease() {
+          waitForEngineLaunched()
+          client.getInfo(infoType).getInfoValue
+        }
+      case unknown => throw new IllegalArgumentException(s"Unknown server info provider $unknown")
     }
   }
 }

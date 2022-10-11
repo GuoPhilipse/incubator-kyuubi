@@ -251,16 +251,11 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
       throw eS; // rethrow the SQLException as is
     } catch (Exception ex) {
       ex.printStackTrace();
-      throw new SQLException("Could not create ResultSet: " + ex.getMessage(), ex);
+      throw new KyuubiSQLException("Could not create ResultSet: " + ex.getMessage(), ex);
     }
   }
 
-  /**
-   * Set the specified schema to the resultset
-   *
-   * @param colNames
-   * @param colTypes
-   */
+  /** Set the specified schema to the resultset */
   private void setSchema(
       List<String> colNames, List<TTypeId> colTypes, List<JdbcColumnAttributes> colAttributes) {
     columnNames.addAll(colNames);
@@ -299,7 +294,7 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
     } catch (SQLException e) {
       throw e;
     } catch (Exception e) {
-      throw new SQLException(e.toString(), "08S01", e);
+      throw new KyuubiSQLException(e.toString(), "08S01", e);
     }
   }
 
@@ -312,13 +307,13 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
   @Override
   public boolean next() throws SQLException {
     if (isClosed) {
-      throw new SQLException("Resultset is closed");
+      throw new KyuubiSQLException("Resultset is closed");
     }
     if (emptyResultSet || (maxRows > 0 && rowsFetched >= maxRows)) {
       return false;
     }
 
-    /**
+    /*
      * Poll on the operation status, till the operation is complete. We need to wait only for
      * HiveStatement to complete. HiveDatabaseMetaData which also uses this ResultSet returns only
      * after the RPC is complete.
@@ -358,7 +353,7 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
       throw eS;
     } catch (Exception ex) {
       ex.printStackTrace();
-      throw new SQLException("Error retrieving next row", ex);
+      throw new KyuubiSQLException("Error retrieving next row", ex);
     }
     // NOTE: fetchOne doesn't throw new SQLFeatureNotSupportedException("Method not supported").
     return true;
@@ -367,7 +362,7 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
   @Override
   public ResultSetMetaData getMetaData() throws SQLException {
     if (isClosed) {
-      throw new SQLException("Resultset is closed");
+      throw new KyuubiSQLException("Resultset is closed");
     }
     return super.getMetaData();
   }
@@ -375,7 +370,7 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
   @Override
   public void setFetchSize(int rows) throws SQLException {
     if (isClosed) {
-      throw new SQLException("Resultset is closed");
+      throw new KyuubiSQLException("Resultset is closed");
     }
     fetchSize = rows;
   }
@@ -383,7 +378,7 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
   @Override
   public int getType() throws SQLException {
     if (isClosed) {
-      throw new SQLException("Resultset is closed");
+      throw new KyuubiSQLException("Resultset is closed");
     }
     if (isScrollable) {
       return ResultSet.TYPE_SCROLL_INSENSITIVE;
@@ -395,7 +390,7 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
   @Override
   public int getFetchSize() throws SQLException {
     if (isClosed) {
-      throw new SQLException("Resultset is closed");
+      throw new KyuubiSQLException("Resultset is closed");
     }
     return fetchSize;
   }
@@ -409,10 +404,10 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
   @Override
   public void beforeFirst() throws SQLException {
     if (isClosed) {
-      throw new SQLException("Resultset is closed");
+      throw new KyuubiSQLException("Resultset is closed");
     }
     if (!isScrollable) {
-      throw new SQLException("Method not supported for TYPE_FORWARD_ONLY resultset");
+      throw new KyuubiSQLException("Method not supported for TYPE_FORWARD_ONLY resultset");
     }
     fetchFirst = true;
     rowsFetched = 0;
@@ -421,7 +416,7 @@ public class KyuubiQueryResultSet extends KyuubiBaseResultSet {
   @Override
   public boolean isBeforeFirst() throws SQLException {
     if (isClosed) {
-      throw new SQLException("Resultset is closed");
+      throw new KyuubiSQLException("Resultset is closed");
     }
     return (rowsFetched == 0);
   }

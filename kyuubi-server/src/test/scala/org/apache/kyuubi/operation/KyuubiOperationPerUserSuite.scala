@@ -17,19 +17,44 @@
 
 package org.apache.kyuubi.operation
 
-import org.apache.hive.service.rpc.thrift.{TExecuteStatementReq, TStatusCode}
+import java.util.UUID
+
+import org.apache.hadoop.fs.{FileSystem, FileUtil, Path}
+import org.apache.hive.service.rpc.thrift.{TExecuteStatementReq, TGetInfoReq, TGetInfoType, TStatusCode}
 import org.scalatest.time.SpanSugar._
 
-import org.apache.kyuubi.{Utils, WithKyuubiServer}
+import org.apache.kyuubi.{KYUUBI_VERSION, Utils, WithKyuubiServer, WithSimpleDFSService}
 import org.apache.kyuubi.config.KyuubiConf
+import org.apache.kyuubi.config.KyuubiConf.KYUUBI_ENGINE_ENV_PREFIX
+import org.apache.kyuubi.engine.SemanticVersion
+import org.apache.kyuubi.jdbc.hive.KyuubiStatement
 import org.apache.kyuubi.session.{KyuubiSessionImpl, KyuubiSessionManager, SessionHandle}
 
-class KyuubiOperationPerUserSuite extends WithKyuubiServer with SparkQueryTests {
+class KyuubiOperationPerUserSuite
+  extends WithKyuubiServer with SparkQueryTests with WithSimpleDFSService {
 
   override protected def jdbcUrl: String = getJdbcUrl
 
   override protected val conf: KyuubiConf = {
     KyuubiConf().set(KyuubiConf.ENGINE_SHARE_LEVEL, "user")
+  }
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    conf.set(s"$KYUUBI_ENGINE_ENV_PREFIX.HADOOP_CONF_DIR", getHadoopConfDir)
+  }
+
+  test("audit Kyuubi server MetaData") {
+    withSessionConf()(Map(KyuubiConf.SERVER_INFO_PROVIDER.key -> "SERVER"))(Map.empty) {
+      withJdbcStatement() { statement =>
+        val metaData = statement.getConnection.getMetaData
+        assert(metaData.getDatabaseProductName === "Apache Kyuubi (Incubating)")
+        assert(metaData.getDatabaseProductVersion === KYUUBI_VERSION)
+        val ver = SemanticVersion(KYUUBI_VERSION)
+        assert(metaData.getDatabaseMajorVersion === ver.majorVersion)
+        assert(metaData.getDatabaseMinorVersion === ver.minorVersion)
+      }
+    }
   }
 
   test("kyuubi defined function - system_user/session_user") {
@@ -157,46 +182,101 @@ class KyuubiOperationPerUserSuite extends WithKyuubiServer with SparkQueryTests 
   }
 
   test("support to interrupt the thrift request if remote engine is broken") {
-    if (!httpMode) {
-      withSessionConf(Map(
-        KyuubiConf.ENGINE_ALIVE_PROBE_ENABLED.key -> "true",
-        KyuubiConf.ENGINE_ALIVE_PROBE_INTERVAL.key -> "1000",
-        KyuubiConf.ENGINE_ALIVE_TIMEOUT.key -> "1000"))(Map.empty)(
-        Map.empty) {
-        withSessionHandle { (client, handle) =>
-          val preReq = new TExecuteStatementReq()
-          preReq.setStatement("select engine_name()")
-          preReq.setSessionHandle(handle)
-          preReq.setRunAsync(false)
-          client.ExecuteStatement(preReq)
+    assume(!httpMode)
+    withSessionConf(Map(
+      KyuubiConf.ENGINE_ALIVE_PROBE_ENABLED.key -> "true",
+      KyuubiConf.ENGINE_ALIVE_PROBE_INTERVAL.key -> "1000",
+      KyuubiConf.ENGINE_ALIVE_TIMEOUT.key -> "1000"))(Map.empty)(
+      Map.empty) {
+      withSessionHandle { (client, handle) =>
+        val preReq = new TExecuteStatementReq()
+        preReq.setStatement("select engine_name()")
+        preReq.setSessionHandle(handle)
+        preReq.setRunAsync(false)
+        client.ExecuteStatement(preReq)
 
-          val sessionHandle = SessionHandle(handle)
-          val session = server.backendService.sessionManager.asInstanceOf[KyuubiSessionManager]
-            .getSession(sessionHandle).asInstanceOf[KyuubiSessionImpl]
-          session.client.getEngineAliveProbeProtocol.foreach(_.getTransport.close())
+        val sessionHandle = SessionHandle(handle)
+        val session = server.backendService.sessionManager.asInstanceOf[KyuubiSessionManager]
+          .getSession(sessionHandle).asInstanceOf[KyuubiSessionImpl]
+        session.client.getEngineAliveProbeProtocol.foreach(_.getTransport.close())
 
-          val exitReq = new TExecuteStatementReq()
-          exitReq.setStatement("SELECT java_method('java.lang.Thread', 'sleep', 1000L)," +
-            "java_method('java.lang.System', 'exit', 1)")
-          exitReq.setSessionHandle(handle)
-          exitReq.setRunAsync(true)
-          client.ExecuteStatement(exitReq)
+        val exitReq = new TExecuteStatementReq()
+        exitReq.setStatement("SELECT java_method('java.lang.Thread', 'sleep', 1000L)," +
+          "java_method('java.lang.System', 'exit', 1)")
+        exitReq.setSessionHandle(handle)
+        exitReq.setRunAsync(true)
+        client.ExecuteStatement(exitReq)
 
-          val executeStmtReq = new TExecuteStatementReq()
-          executeStmtReq.setStatement("SELECT java_method('java.lang.Thread', 'sleep', 30000l)")
-          executeStmtReq.setSessionHandle(handle)
-          executeStmtReq.setRunAsync(false)
-          val startTime = System.currentTimeMillis()
-          val executeStmtResp = client.ExecuteStatement(executeStmtReq)
-          assert(executeStmtResp.getStatus.getStatusCode === TStatusCode.ERROR_STATUS)
-          assert(executeStmtResp.getStatus.getErrorMessage.contains(
-            "java.net.SocketException: Connection reset") ||
-            executeStmtResp.getStatus.getErrorMessage.contains(
-              "Caused by: java.net.SocketException: Broken pipe (Write failed)"))
-          val elapsedTime = System.currentTimeMillis() - startTime
-          assert(elapsedTime < 20 * 1000)
-          assert(session.client.asyncRequestInterrupted)
-        }
+        val executeStmtReq = new TExecuteStatementReq()
+        executeStmtReq.setStatement("SELECT java_method('java.lang.Thread', 'sleep', 30000l)")
+        executeStmtReq.setSessionHandle(handle)
+        executeStmtReq.setRunAsync(false)
+        val startTime = System.currentTimeMillis()
+        val executeStmtResp = client.ExecuteStatement(executeStmtReq)
+        assert(executeStmtResp.getStatus.getStatusCode === TStatusCode.ERROR_STATUS)
+        assert(executeStmtResp.getStatus.getErrorMessage.contains(
+          "java.net.SocketException: Connection reset") ||
+          executeStmtResp.getStatus.getErrorMessage.contains(
+            "Caused by: java.net.SocketException: Broken pipe (Write failed)"))
+        val elapsedTime = System.currentTimeMillis() - startTime
+        assert(elapsedTime < 20 * 1000)
+        assert(session.client.asyncRequestInterrupted)
+      }
+    }
+  }
+
+  test("scala NPE issue with hdfs jar") {
+    val jarDir = Utils.createTempDir().toFile
+    val udfCode =
+      """
+        |package test.utils
+        |
+        |object Math {
+        |def add(x: Int, y: Int): Int = x + y
+        |}
+        |
+        |""".stripMargin
+    val jarFile = UserJarTestUtils.createJarFile(
+      udfCode,
+      "test",
+      s"test-function-${UUID.randomUUID}.jar",
+      jarDir.toString)
+    val hadoopConf = getHadoopConf
+    val dfs = FileSystem.get(hadoopConf)
+    val dfsJarDir = dfs.makeQualified(new Path(s"jars-${UUID.randomUUID()}"))
+    val localFs = FileSystem.getLocal(hadoopConf)
+    val localPath = new Path(jarFile.getAbsolutePath)
+    val dfsJarPath = new Path(dfsJarDir, "test-function.jar")
+    FileUtil.copy(localFs, localPath, dfs, dfsJarPath, false, false, hadoopConf)
+    withJdbcStatement() { statement =>
+      val kyuubiStatement = statement.asInstanceOf[KyuubiStatement]
+      statement.executeQuery(s"add jar $dfsJarPath")
+      val rs = kyuubiStatement.executeScala("println(test.utils.Math.add(1,2))")
+      rs.next()
+      assert(rs.getString(1) === "3")
+    }
+  }
+
+  test("server info provider - server") {
+    assume(!httpMode)
+    withSessionConf(Map(KyuubiConf.SERVER_INFO_PROVIDER.key -> "SERVER"))()() {
+      withSessionHandle { (client, handle) =>
+        val req = new TGetInfoReq()
+        req.setSessionHandle(handle)
+        req.setInfoType(TGetInfoType.CLI_DBMS_NAME)
+        assert(client.GetInfo(req).getInfoValue.getStringValue === "Apache Kyuubi (Incubating)")
+      }
+    }
+  }
+
+  test("server info provider - engine") {
+    assume(!httpMode)
+    withSessionConf(Map(KyuubiConf.SERVER_INFO_PROVIDER.key -> "ENGINE"))()() {
+      withSessionHandle { (client, handle) =>
+        val req = new TGetInfoReq()
+        req.setSessionHandle(handle)
+        req.setInfoType(TGetInfoType.CLI_DBMS_NAME)
+        assert(client.GetInfo(req).getInfoValue.getStringValue === "Spark SQL")
       }
     }
   }

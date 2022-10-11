@@ -21,7 +21,7 @@ import java.sql.{DatabaseMetaData, ResultSet, SQLException, SQLFeatureNotSupport
 
 import scala.util.Random
 
-import org.apache.kyuubi.{KYUUBI_VERSION, KyuubiSQLException, Utils}
+import org.apache.kyuubi.{KYUUBI_VERSION, KyuubiSQLException}
 import org.apache.kyuubi.operation.meta.ResultSetSchemaConstant._
 
 // For both `in-memory` and `hive` external catalog
@@ -293,7 +293,7 @@ trait SparkMetadataTests extends HiveJDBCTestHelper {
     }
   }
 
-  test("audit Kyuubi Hive JDBC connection MetaData") {
+  test("audit Kyuubi Hive JDBC connection common MetaData") {
     withJdbcStatement() { statement =>
       val metaData = statement.getConnection.getMetaData
       Seq(
@@ -404,12 +404,8 @@ trait SparkMetadataTests extends HiveJDBCTestHelper {
 
       assert(metaData.allTablesAreSelectable)
       assert(metaData.getClientInfoProperties.next)
-      assert(metaData.getDatabaseProductName === "Apache Kyuubi (Incubating)")
-      assert(metaData.getDatabaseProductVersion === KYUUBI_VERSION)
       assert(metaData.getDriverName === "Kyuubi Project Hive JDBC Shaded Client")
       assert(metaData.getDriverVersion === KYUUBI_VERSION)
-      assert(metaData.getDatabaseMajorVersion === Utils.majorVersion(KYUUBI_VERSION))
-      assert(metaData.getDatabaseMinorVersion === Utils.minorVersion(KYUUBI_VERSION))
       assert(
         metaData.getIdentifierQuoteString === " ",
         "This method returns a space \" \" if identifier quoting is not supported")
@@ -453,21 +449,16 @@ trait SparkMetadataTests extends HiveJDBCTestHelper {
       assert(metaData.getDefaultTransactionIsolation === java.sql.Connection.TRANSACTION_NONE)
       assert(!metaData.supportsTransactions)
       assert(!metaData.getProcedureColumns("", "%", "%", "%").next())
-      try {
-        assert(!metaData.getPrimaryKeys("", "default", "src").next())
-      } catch {
-        case e: Exception =>
-          assert(e.isInstanceOf[SQLException])
-          assert(e.getMessage.contains(KyuubiSQLException.featureNotSupported().getMessage))
+      val e1 = intercept[SQLException] {
+        metaData.getPrimaryKeys("", "default", "src").next()
       }
+      assert(e1.getMessage.contains(KyuubiSQLException.featureNotSupported().getMessage))
       assert(!metaData.getImportedKeys("", "default", "").next())
-      try {
-        assert(!metaData.getCrossReference("", "default", "src", "", "default", "src2").next())
-      } catch {
-        case e: Exception =>
-          assert(e.isInstanceOf[SQLException])
-          assert(e.getMessage.contains(KyuubiSQLException.featureNotSupported().getMessage))
+
+      val e2 = intercept[SQLException] {
+        metaData.getCrossReference("", "default", "src", "", "default", "src2").next()
       }
+      assert(e2.getMessage.contains(KyuubiSQLException.featureNotSupported().getMessage))
       assert(!metaData.getIndexInfo("", "default", "src", true, true).next())
 
       assert(metaData.supportsResultSetType(new Random().nextInt()))

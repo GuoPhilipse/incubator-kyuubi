@@ -29,13 +29,14 @@ import org.apache.kyuubi.{KYUUBI_VERSION, KyuubiSQLException, Logging, Utils}
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.config.KyuubiConf._
 import org.apache.kyuubi.config.KyuubiReservedKeys.KYUUBI_ENGINE_SUBMIT_TIME_KEY
-import org.apache.kyuubi.engine.EngineType.{EngineType, FLINK_SQL, HIVE_SQL, SPARK_SQL, TRINO}
+import org.apache.kyuubi.engine.EngineType.{EngineType, FLINK_SQL, HIVE_SQL, JDBC, SPARK_SQL, TRINO}
 import org.apache.kyuubi.engine.ShareLevel.{CONNECTION, GROUP, SERVER, ShareLevel}
 import org.apache.kyuubi.engine.flink.FlinkProcessBuilder
 import org.apache.kyuubi.engine.hive.HiveProcessBuilder
+import org.apache.kyuubi.engine.jdbc.JdbcProcessBuilder
 import org.apache.kyuubi.engine.spark.SparkProcessBuilder
 import org.apache.kyuubi.engine.trino.TrinoProcessBuilder
-import org.apache.kyuubi.ha.HighAvailabilityConf.{HA_NAMESPACE, HA_ZK_ENGINE_REF_ID}
+import org.apache.kyuubi.ha.HighAvailabilityConf.{HA_ENGINE_REF_ID, HA_NAMESPACE}
 import org.apache.kyuubi.ha.client.{DiscoveryClient, DiscoveryPaths}
 import org.apache.kyuubi.metrics.MetricsConstants.{ENGINE_FAIL, ENGINE_TIMEOUT, ENGINE_TOTAL}
 import org.apache.kyuubi.metrics.MetricsSystem
@@ -167,7 +168,7 @@ private[kyuubi] class EngineRef(
     if (engineRef.nonEmpty) return engineRef.get
 
     conf.set(HA_NAMESPACE, engineSpace)
-    conf.set(HA_ZK_ENGINE_REF_ID, engineRefId)
+    conf.set(HA_ENGINE_REF_ID, engineRefId)
     val started = System.currentTimeMillis()
     conf.set(KYUUBI_ENGINE_SUBMIT_TIME_KEY, String.valueOf(started))
     builder = engineType match {
@@ -181,12 +182,15 @@ private[kyuubi] class EngineRef(
         new TrinoProcessBuilder(appUser, conf, engineRefId, extraEngineLog)
       case HIVE_SQL =>
         new HiveProcessBuilder(appUser, conf, engineRefId, extraEngineLog)
+      case JDBC =>
+        new JdbcProcessBuilder(appUser, conf, engineRefId, extraEngineLog)
     }
 
     MetricsSystem.tracing(_.incCount(ENGINE_TOTAL))
     try {
       val redactedCmd = builder.toString
       info(s"Launching engine:\n$redactedCmd")
+      builder.validateConf
       val process = builder.start
       var exitValue: Option[Int] = None
       while (engineRef.isEmpty) {
@@ -201,6 +205,28 @@ private[kyuubi] class EngineRef(
             throw error
           }
         }
+
+        // even the submit process succeeds, the application might meet failure when initializing,
+        // check the engine application state from engine manager and fast fail on engine terminate
+        if (exitValue == Some(0)) {
+          Option(engineManager).foreach { engineMgr =>
+            engineMgr.getApplicationInfo(builder.clusterManager(), engineRefId).foreach { appInfo =>
+              if (ApplicationState.isTerminated(appInfo.state)) {
+                MetricsSystem.tracing { ms =>
+                  ms.incCount(MetricRegistry.name(ENGINE_FAIL, appUser))
+                  ms.incCount(MetricRegistry.name(ENGINE_FAIL, "ENGINE_TERMINATE"))
+                }
+                throw new KyuubiSQLException(
+                  s"""
+                     |The engine application has been terminated. Please check the engine log.
+                     |ApplicationInfo: ${appInfo.toMap.mkString("(\n", ",\n", "\n)")}
+                     |""".stripMargin,
+                  builder.getError)
+              }
+            }
+          }
+        }
+
         if (started + timeout <= System.currentTimeMillis()) {
           val killMessage = engineManager.killApplication(builder.clusterManager(), engineRefId)
           process.destroyForcibly()

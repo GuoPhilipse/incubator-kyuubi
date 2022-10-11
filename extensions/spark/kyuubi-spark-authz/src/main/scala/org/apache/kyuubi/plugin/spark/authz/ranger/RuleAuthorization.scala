@@ -19,22 +19,30 @@ package org.apache.kyuubi.plugin.spark.authz.ranger
 
 import scala.collection.mutable.ArrayBuffer
 
+import org.apache.ranger.plugin.policyengine.RangerAccessRequest
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 
-import org.apache.kyuubi.plugin.spark.authz.{ObjectType, _}
+import org.apache.kyuubi.plugin.spark.authz._
 import org.apache.kyuubi.plugin.spark.authz.ObjectType._
-import org.apache.kyuubi.plugin.spark.authz.util.AuthZUtils._
-
+import org.apache.kyuubi.plugin.spark.authz.ranger.RuleAuthorization.KYUUBI_AUTHZ_TAG
+import org.apache.kyuubi.plugin.spark.authz.ranger.SparkRangerAdminPlugin._
+import org.apache.kyuubi.plugin.spark.authz.util.AuthZUtils._;
 class RuleAuthorization(spark: SparkSession) extends Rule[LogicalPlan] {
-  override def apply(plan: LogicalPlan): LogicalPlan = {
-    RuleAuthorization.checkPrivileges(spark, plan)
-    plan
+  override def apply(plan: LogicalPlan): LogicalPlan = plan match {
+    case p if !plan.getTagValue(KYUUBI_AUTHZ_TAG).contains(true) =>
+      RuleAuthorization.checkPrivileges(spark, p)
+      p.setTagValue(KYUUBI_AUTHZ_TAG, true)
+      p
+    case p => p // do nothing if checked privileges already.
   }
 }
 
 object RuleAuthorization {
+
+  val KYUUBI_AUTHZ_TAG = TreeNodeTag[Boolean]("__KYUUBI_AUTHZ_TAG")
 
   def checkPrivileges(spark: SparkSession, plan: LogicalPlan): Unit = {
     val auditHandler = new SparkRangerAuditHandler
@@ -61,26 +69,24 @@ object RuleAuthorization {
     addAccessRequest(inputs, isInput = true)
     addAccessRequest(outputs, isInput = false)
 
-    requests.foreach { request =>
+    val requestArrays = requests.map { request =>
       val resource = request.getResource.asInstanceOf[AccessResource]
       resource.objectType match {
         case ObjectType.COLUMN if resource.getColumns.nonEmpty =>
-          resource.getColumns.foreach { col =>
+          resource.getColumns.map { col =>
             val cr = AccessResource(COLUMN, resource.getDatabase, resource.getTable, col)
-            val req = AccessRequest(cr, ugi, opType, request.accessType)
-            verify(req, auditHandler)
+            AccessRequest(cr, ugi, opType, request.accessType).asInstanceOf[RangerAccessRequest]
           }
-        case _ => verify(request, auditHandler)
+        case _ => Seq(request)
       }
     }
-  }
 
-  private def verify(req: AccessRequest, auditHandler: SparkRangerAuditHandler): Unit = {
-    val ret = SparkRangerAdminPlugin.isAccessAllowed(req, auditHandler)
-    if (ret != null && !ret.getIsAllowed) {
-      throw new RuntimeException(
-        s"Permission denied: user [${req.getUser}] does not have [${req.getAccessType}] privilege" +
-          s" on [${req.getResource.getAsString}]")
+    if (authorizeInSingleCall) {
+      verify(requestArrays.flatten, auditHandler)
+    } else {
+      requestArrays.flatten.foreach { req =>
+        verify(Seq(req), auditHandler)
+      }
     }
   }
 }

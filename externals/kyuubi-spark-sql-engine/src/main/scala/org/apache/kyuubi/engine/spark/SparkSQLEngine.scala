@@ -18,7 +18,7 @@
 package org.apache.kyuubi.engine.spark
 
 import java.time.Instant
-import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.{CountDownLatch, ScheduledExecutorService, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.concurrent.duration.Duration
@@ -35,9 +35,8 @@ import org.apache.kyuubi.config.{KyuubiConf, KyuubiReservedKeys}
 import org.apache.kyuubi.config.KyuubiConf._
 import org.apache.kyuubi.config.KyuubiReservedKeys.KYUUBI_ENGINE_SUBMIT_TIME_KEY
 import org.apache.kyuubi.engine.spark.SparkSQLEngine.{countDownLatch, currentEngine}
-import org.apache.kyuubi.engine.spark.events.{EngineEvent, EngineEventsStore}
-import org.apache.kyuubi.engine.spark.events.handler.{SparkHistoryLoggingEventHandler, SparkJsonLoggingEventHandler}
-import org.apache.kyuubi.events.{EventBus, EventLoggerType, KyuubiEvent}
+import org.apache.kyuubi.engine.spark.events.{EngineEvent, EngineEventsStore, SparkEventHandlerRegister}
+import org.apache.kyuubi.events.EventBus
 import org.apache.kyuubi.ha.HighAvailabilityConf._
 import org.apache.kyuubi.ha.client.RetryPolicies
 import org.apache.kyuubi.service.Serverable
@@ -50,8 +49,7 @@ case class SparkSQLEngine(spark: SparkSession) extends Serverable("SparkSQLEngin
 
   private val shutdown = new AtomicBoolean(false)
 
-  private val lifetimeTerminatingChecker =
-    ThreadUtils.newDaemonSingleThreadScheduledExecutor("spark-engine-lifetime-checker")
+  @volatile private var lifetimeTerminatingChecker: Option[ScheduledExecutorService] = None
 
   override def initialize(conf: KyuubiConf): Unit = {
     val listener = new SparkSQLEngineListener(this)
@@ -79,10 +77,12 @@ case class SparkSQLEngine(spark: SparkSession) extends Serverable("SparkSQLEngin
 
   override def stop(): Unit = if (shutdown.compareAndSet(false, true)) {
     super.stop()
-    val shutdownTimeout = conf.get(ENGINE_EXEC_POOL_SHUTDOWN_TIMEOUT)
-    ThreadUtils.shutdown(
-      lifetimeTerminatingChecker,
-      Duration(shutdownTimeout, TimeUnit.MILLISECONDS))
+    lifetimeTerminatingChecker.foreach(checker => {
+      val shutdownTimeout = conf.get(ENGINE_EXEC_POOL_SHUTDOWN_TIMEOUT)
+      ThreadUtils.shutdown(
+        checker,
+        Duration(shutdownTimeout, TimeUnit.MILLISECONDS))
+    })
   }
 
   override protected def stopServer(): Unit = {
@@ -109,7 +109,9 @@ case class SparkSQLEngine(spark: SparkSession) extends Serverable("SparkSQLEngin
           }
         }
       }
-      lifetimeTerminatingChecker.scheduleWithFixedDelay(
+      lifetimeTerminatingChecker =
+        Some(ThreadUtils.newDaemonSingleThreadScheduledExecutor("spark-engine-lifetime-checker"))
+      lifetimeTerminatingChecker.get.scheduleWithFixedDelay(
         checkTask,
         interval,
         interval,
@@ -145,7 +147,6 @@ object SparkSQLEngine extends Logging {
     _sparkConf.setIfMissing("spark.sql.execution.topKSortFallbackThreshold", "10000")
     _sparkConf.setIfMissing("spark.sql.legacy.castComplexTypesToString.enabled", "true")
     _sparkConf.setIfMissing("spark.master", "local")
-    _sparkConf.setIfMissing("spark.ui.port", "0")
     _sparkConf.set(
       "spark.redaction.regex",
       _sparkConf.get("spark.redaction.regex", "(?i)secret|password|token|access[.]key")
@@ -162,8 +163,17 @@ object SparkSQLEngine extends Logging {
     val defaultCat = if (KyuubiSparkUtil.hiveClassesArePresent) "hive" else "in-memory"
     _sparkConf.setIfMissing("spark.sql.catalogImplementation", defaultCat)
 
-    kyuubiConf.setIfMissing(KyuubiConf.FRONTEND_THRIFT_BINARY_BIND_PORT, 0)
+    kyuubiConf.setIfMissing(FRONTEND_THRIFT_BINARY_BIND_PORT, 0)
     kyuubiConf.setIfMissing(HA_ZK_CONN_RETRY_POLICY, RetryPolicies.N_TIME.toString)
+
+    if (Utils.isOnK8s) {
+      kyuubiConf.setIfMissing(FRONTEND_CONNECTION_URL_USE_HOSTNAME, false)
+    }
+
+    // Set web ui port 0 to avoid port conflicts during non-k8s cluster mode
+    if (!isOnK8sClusterMode) {
+      _sparkConf.setIfMissing("spark.ui.port", "0")
+    }
 
     // Pass kyuubi config from spark with `spark.kyuubi`
     val sparkToKyuubiPrefix = "spark.kyuubi."
@@ -235,27 +245,9 @@ object SparkSQLEngine extends Logging {
     }
 
     def initLoggerEventHandler(conf: KyuubiConf): Unit = {
-      conf.get(ENGINE_EVENT_LOGGERS)
-        .map(EventLoggerType.withName)
-        .foreach {
-          case EventLoggerType.SPARK =>
-            EventBus.register[KyuubiEvent](new SparkHistoryLoggingEventHandler(spark.sparkContext))
-          case EventLoggerType.JSON =>
-            val handler = SparkJsonLoggingEventHandler(
-              spark.sparkContext.applicationAttemptId
-                .map(id => s"${spark.sparkContext.applicationId}_$id")
-                .getOrElse(spark.sparkContext.applicationId),
-              ENGINE_EVENT_JSON_LOG_PATH,
-              spark.sparkContext.hadoopConfiguration,
-              conf)
-
-            // register JsonLogger as a event handler for default event bus
-            EventBus.register[KyuubiEvent](handler)
-          case _ =>
-        }
-
+      val sparkEventRegister = new SparkEventHandlerRegister(spark)
+      sparkEventRegister.registerEventLoggers(conf)
     }
-
   }
 
   def main(args: Array[String]): Unit = {
@@ -320,5 +312,10 @@ object SparkSQLEngine extends Logging {
         }
       },
       "CreateSparkTimeoutChecker").start()
+  }
+
+  private def isOnK8sClusterMode: Boolean = {
+    // only spark driver pod will build with `SPARK_APPLICATION_ID` env.
+    Utils.isOnK8s && sys.env.contains("SPARK_APPLICATION_ID")
   }
 }

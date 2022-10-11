@@ -19,13 +19,12 @@ package org.apache.kyuubi.engine.flink.operation
 
 import java.time.LocalDate
 import java.util
-import java.util.concurrent.RejectedExecutionException
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 
-import org.apache.calcite.rel.metadata.{DefaultRelMetadataProvider, JaninoRelMetadataProvider, RelMetadataQueryBase}
-import org.apache.flink.table.api.ResultKind
+import org.apache.flink.api.common.JobID
+import org.apache.flink.table.api.{ResultKind, TableResult}
 import org.apache.flink.table.client.gateway.TypedResult
 import org.apache.flink.table.data.{GenericArrayData, GenericMapData, RowData}
 import org.apache.flink.table.data.binary.{BinaryArrayData, BinaryMapData}
@@ -35,11 +34,13 @@ import org.apache.flink.table.types.DataType
 import org.apache.flink.table.types.logical._
 import org.apache.flink.types.Row
 
-import org.apache.kyuubi.{KyuubiSQLException, Logging}
+import org.apache.kyuubi.Logging
+import org.apache.kyuubi.engine.flink.FlinkEngineUtils._
 import org.apache.kyuubi.engine.flink.result.ResultSet
 import org.apache.kyuubi.engine.flink.schema.RowSet.toHiveString
 import org.apache.kyuubi.operation.OperationState
 import org.apache.kyuubi.operation.log.OperationLog
+import org.apache.kyuubi.reflection.DynMethods
 import org.apache.kyuubi.session.Session
 import org.apache.kyuubi.util.RowSetUtils
 
@@ -53,6 +54,8 @@ class ExecuteStatement(
 
   private val operationLog: OperationLog =
     OperationLog.createOperationLog(session, getHandle)
+
+  var jobId: Option[JobID] = None
 
   override def getOperationLog: Option[OperationLog] = Option(operationLog)
 
@@ -68,38 +71,12 @@ class ExecuteStatement(
 
   override protected def runInternal(): Unit = {
     addTimeoutMonitor(queryTimeout)
-    if (shouldRunAsync) {
-      val asyncOperation = new Runnable {
-        override def run(): Unit = {
-          OperationLog.setCurrentOperationLog(operationLog)
-          executeStatement()
-        }
-      }
-
-      try {
-        val flinkSQLSessionManager = session.sessionManager
-        val backgroundHandle = flinkSQLSessionManager.submitBackgroundOperation(asyncOperation)
-        setBackgroundHandle(backgroundHandle)
-      } catch {
-        case rejected: RejectedExecutionException =>
-          setState(OperationState.ERROR)
-          val ke =
-            KyuubiSQLException("Error submitting query in background, query rejected", rejected)
-          setOperationException(ke)
-          throw ke
-      }
-    } else {
-      executeStatement()
-    }
+    executeStatement()
   }
 
   private def executeStatement(): Unit = {
     try {
       setState(OperationState.RUNNING)
-
-      // set the thread variable THREAD_PROVIDERS
-      RelMetadataQueryBase.THREAD_PROVIDERS.set(
-        JaninoRelMetadataProvider.of(DefaultRelMetadataProvider.INSTANCE))
       val operation = executor.parseStatement(sessionId, statement)
       operation match {
         case queryOperation: QueryOperation => runQueryOperation(queryOperation)
@@ -144,17 +121,16 @@ class ExecuteStatement(
             (1 to result.getPayload).foreach { page =>
               if (rows.size < resultMaxRows) {
                 // FLINK-24461 retrieveResultPage method changes the return type from Row to RowData
-                val result = executor.retrieveResultPage(resultId, page).asScala.toList
-                result.headOption match {
-                  case None =>
-                  case Some(r) =>
-                    // for flink 1.14
-                    if (r.getClass == classOf[Row]) {
-                      rows ++= result.asInstanceOf[List[Row]]
-                    } else {
-                      // for flink 1.15+
-                      rows ++= result.map(r => convertToRow(r.asInstanceOf[RowData], dataTypes))
-                    }
+                val retrieveResultPage = DynMethods.builder("retrieveResultPage")
+                  .impl(executor.getClass, classOf[String], classOf[Int])
+                  .build(executor)
+                val _page = Integer.valueOf(page)
+                if (isFlinkVersionEqualTo("1.14")) {
+                  val result = retrieveResultPage.invoke[util.List[Row]](resultId, _page)
+                  rows ++= result.asScala
+                } else if (isFlinkVersionAtLeast("1.15")) {
+                  val result = retrieveResultPage.invoke[util.List[RowData]](resultId, _page)
+                  rows ++= result.asScala.map(r => convertToRow(r, dataTypes))
                 }
               } else {
                 loop = false
@@ -178,7 +154,13 @@ class ExecuteStatement(
   }
 
   private def runOperation(operation: Operation): Unit = {
-    val result = executor.executeOperation(sessionId, operation)
+    // FLINK-24461 executeOperation method changes the return type
+    // from TableResult to TableResultInternal
+    val executeOperation = DynMethods.builder("executeOperation")
+      .impl(executor.getClass, classOf[String], classOf[Operation])
+      .build(executor)
+    val result = executeOperation.invoke[TableResult](sessionId, operation)
+    jobId = result.getJobClient.asScala.map(_.getJobID)
     result.await()
     resultSet = ResultSet.fromTableResult(result)
   }
@@ -244,7 +226,7 @@ class ExecuteStatement(
               case d: BinaryMapData =>
                 val kvArray = toArray(keyType, valueType, d)
                 val map: util.Map[Any, Any] = new util.HashMap[Any, Any]
-                for (i <- 0 until kvArray._1.length) {
+                for (i <- kvArray._1.indices) {
                   val value: Any = kvArray._2(i)
                   map.put(kvArray._1(i), value)
                 }
@@ -257,8 +239,14 @@ class ExecuteStatement(
         case _: DoubleType =>
           row.setField(i, r.getDouble(i))
         case t: RowType =>
-          val v = r.getRow(i, t.getFieldCount)
-          row.setField(i, v)
+          val fieldDataTypes = DynMethods.builder("getFieldDataTypes")
+            .impl(classOf[DataType], classOf[DataType])
+            .buildStatic
+            .invoke[util.List[DataType]](dataType)
+            .asScala.toList
+          val internalRowData = r.getRow(i, t.getFieldCount)
+          val internalRow = convertToRow(internalRowData, fieldDataTypes)
+          row.setField(i, internalRow)
         case t =>
           val hiveString = toHiveString((row.getField(i), t))
           row.setField(i, hiveString)

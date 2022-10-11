@@ -23,19 +23,20 @@ import scala.concurrent.duration._
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.net.NetUtils
 
-import org.apache.kyuubi.{Logging, Utils, WithKyuubiServer, WithSimpleDFSService}
-import org.apache.kyuubi.client.api.v1.dto.BatchRequest
+import org.apache.kyuubi.{BatchTestHelper, KyuubiException, Logging, Utils, WithKyuubiServer, WithSimpleDFSService}
 import org.apache.kyuubi.config.KyuubiConf
-import org.apache.kyuubi.config.KyuubiConf.{FRONTEND_CONNECTION_URL_USE_HOSTNAME, FRONTEND_THRIFT_BINARY_BIND_HOST}
-import org.apache.kyuubi.engine.{ApplicationOperation, KubernetesApplicationOperation}
+import org.apache.kyuubi.config.KyuubiConf.FRONTEND_THRIFT_BINARY_BIND_HOST
+import org.apache.kyuubi.engine.{ApplicationInfo, ApplicationOperation, KubernetesApplicationOperation}
+import org.apache.kyuubi.engine.ApplicationState.{FAILED, NOT_FOUND, RUNNING}
 import org.apache.kyuubi.engine.spark.SparkProcessBuilder
 import org.apache.kyuubi.kubernetes.test.MiniKube
 import org.apache.kyuubi.operation.SparkQueryTests
 import org.apache.kyuubi.session.{KyuubiBatchSessionImpl, KyuubiSessionManager}
+import org.apache.kyuubi.util.Validator.KUBERNETES_EXECUTOR_POD_NAME_PREFIX
 import org.apache.kyuubi.zookeeper.ZookeeperConf.ZK_CLIENT_PORT_ADDRESS
 
 abstract class SparkOnKubernetesSuiteBase
-  extends WithKyuubiServer with Logging {
+  extends WithKyuubiServer with Logging with BatchTestHelper {
   private val apiServerAddress = {
     MiniKube.getKubernetesClient.getMasterUrl.toString
   }
@@ -52,6 +53,7 @@ abstract class SparkOnKubernetesSuiteBase
       .set("spark.kubernetes.driver.request.cores", "250m")
       .set("spark.kubernetes.executor.request.cores", "250m")
       .set("kyuubi.kubernetes.context", "minikube")
+      .set("kyuubi.frontend.protocols", "THRIFT_BINARY,REST")
   }
 }
 
@@ -111,7 +113,6 @@ class SparkClusterModeOnKubernetesSuiteBase
       .set("spark.kubernetes.authenticate.driver.serviceAccountName", "spark")
       .set("spark.kubernetes.driver.podTemplateFile", driverTemplate.getPath)
       .set(ZK_CLIENT_PORT_ADDRESS.key, localhostAddress)
-      .set(FRONTEND_CONNECTION_URL_USE_HOSTNAME.key, "false")
       .set(FRONTEND_THRIFT_BINARY_BIND_HOST.key, localhostAddress)
   }
 }
@@ -133,14 +134,7 @@ class KyuubiOperationKubernetesClusterClientModeSuite
     server.backendService.sessionManager.asInstanceOf[KyuubiSessionManager]
 
   test("Spark Client Mode On Kubernetes Kyuubi KubernetesApplicationOperation Suite") {
-    val sparkProcessBuilder = new SparkProcessBuilder("kyuubi", conf)
-    val batchRequest = new BatchRequest(
-      "spark",
-      sparkProcessBuilder.mainResource.get,
-      sparkProcessBuilder.mainClass,
-      null,
-      conf.getAll.asJava,
-      Seq.empty[String].asJava)
+    val batchRequest = newSparkBatchRequest(conf.getAll)
 
     val sessionHandle = sessionManager.openBatchSession(
       "kyuubi",
@@ -151,10 +145,9 @@ class KyuubiOperationKubernetesClusterClientModeSuite
 
     eventually(timeout(3.minutes), interval(50.milliseconds)) {
       val state = k8sOperation.getApplicationInfoByTag(sessionHandle.identifier.toString)
-      assert(state.nonEmpty)
-      assert(state.contains("id"))
-      assert(state.contains("name"))
-      assert(state("state") === "RUNNING")
+      assert(state.id != null)
+      assert(state.name != null)
+      assert(state.state == RUNNING)
     }
 
     val killResponse = k8sOperation.killApplicationByTag(sessionHandle.identifier.toString)
@@ -162,9 +155,7 @@ class KyuubiOperationKubernetesClusterClientModeSuite
     assert(killResponse._2 startsWith "Succeeded to terminate:")
 
     val appInfo = k8sOperation.getApplicationInfoByTag(sessionHandle.identifier.toString)
-    assert(!appInfo.contains("id"))
-    assert(!appInfo.contains("name"))
-    assert(appInfo("state") === "FINISHED")
+    assert(appInfo == ApplicationInfo(null, null, NOT_FOUND))
 
     val failKillResponse = k8sOperation.killApplicationByTag(sessionHandle.identifier.toString)
     assert(!failKillResponse._1)
@@ -183,20 +174,24 @@ class KyuubiOperationKubernetesClusterClusterModeSuite
   private def sessionManager: KyuubiSessionManager =
     server.backendService.sessionManager.asInstanceOf[KyuubiSessionManager]
 
+  test("Check if spark.kubernetes.executor.podNamePrefix is invalid") {
+    Seq("_123", "spark_exec", "spark@", "a" * 238).foreach { invalid =>
+      conf.set(KUBERNETES_EXECUTOR_POD_NAME_PREFIX, invalid)
+      val builder = new SparkProcessBuilder("test", conf)
+      val e = intercept[KyuubiException](builder.validateConf)
+      assert(e.getMessage === s"'$invalid' in spark.kubernetes.executor.podNamePrefix is" +
+        s" invalid. must conform https://kubernetes.io/docs/concepts/overview/" +
+        "working-with-objects/names/#dns-subdomain-names and the value length <= 237")
+    }
+  }
+
   test("Spark Cluster Mode On Kubernetes Kyuubi KubernetesApplicationOperation Suite") {
     val driverPodNamePrefix = "kyuubi-spark-driver"
     conf.set(
       "spark.kubernetes.driver.pod.name",
       driverPodNamePrefix + "-" + System.currentTimeMillis())
 
-    val sparkProcessBuilder = new SparkProcessBuilder("kyuubi", conf)
-    val batchRequest = new BatchRequest(
-      "spark",
-      sparkProcessBuilder.mainResource.get,
-      sparkProcessBuilder.mainClass,
-      null,
-      conf.getAll.asJava,
-      Seq.empty[String].asJava)
+    val batchRequest = newSparkBatchRequest(conf.getAll)
 
     val sessionHandle = sessionManager.openBatchSession(
       "runner",
@@ -209,10 +204,10 @@ class KyuubiOperationKubernetesClusterClusterModeSuite
     val batchJobSubmissionOp = session.batchJobSubmissionOp
 
     eventually(timeout(3.minutes), interval(50.milliseconds)) {
-      val state = batchJobSubmissionOp.currentApplicationState
-      assert(state.nonEmpty)
-      assert(state.exists(_("state") == "Running"))
-      assert(state.exists(_("name").startsWith(driverPodNamePrefix)))
+      val appInfo = batchJobSubmissionOp.currentApplicationInfo
+      assert(appInfo.nonEmpty)
+      assert(appInfo.exists(_.state == RUNNING))
+      assert(appInfo.exists(_.name.startsWith(driverPodNamePrefix)))
     }
 
     val killResponse = k8sOperation.killApplicationByTag(sessionHandle.identifier.toString)
@@ -223,7 +218,7 @@ class KyuubiOperationKubernetesClusterClusterModeSuite
       val appInfo = k8sOperation.getApplicationInfoByTag(sessionHandle.identifier.toString)
       // We may kill engine start but not ready
       // An EOF Error occurred when the driver was starting
-      assert(appInfo("state") == "Error" || appInfo("state") == "FINISHED")
+      assert(appInfo.state == FAILED || appInfo.state == NOT_FOUND)
     }
 
     val failKillResponse = k8sOperation.killApplicationByTag(sessionHandle.identifier.toString)

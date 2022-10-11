@@ -33,6 +33,7 @@ import org.apache.thrift.server.TServlet
 
 import org.apache.kyuubi.Logging
 import org.apache.kyuubi.config.KyuubiConf
+import org.apache.kyuubi.config.KyuubiConf.FRONTEND_PROXY_HTTP_CLIENT_IP_HEADER
 import org.apache.kyuubi.server.http.authentication.AuthenticationFilter
 import org.apache.kyuubi.server.http.authentication.AuthenticationHandler.AUTHORIZATION_HEADER
 import org.apache.kyuubi.server.http.util.{CookieSigner, HttpAuthUtils, SessionManager}
@@ -78,7 +79,6 @@ class ThriftHttpServlet(
   @throws[IOException]
   override def doPost(request: HttpServletRequest, response: HttpServletResponse): Unit = {
     var clientUserName: String = null
-    var clientIpAddress: String = null
     var requireNewCookie: Boolean = false
     try {
       if (conf.get(KyuubiConf.FRONTEND_THRIFT_HTTP_XSRF_FILTER_ENABLED)) {
@@ -118,10 +118,15 @@ class ThriftHttpServlet(
       val doAsQueryParam = getDoAsQueryParam(request.getQueryString)
       if (doAsQueryParam != null) SessionManager.setProxyUserName(doAsQueryParam)
 
-      clientIpAddress = request.getRemoteAddr
+      val clientIpAddress = request.getRemoteAddr
       debug("Client IP Address: " + clientIpAddress)
-      // Set the thread local ip address
       SessionManager.setIpAddress(clientIpAddress)
+
+      Option(request.getHeader(conf.get(FRONTEND_PROXY_HTTP_CLIENT_IP_HEADER))).foreach {
+        ipAddress =>
+          debug("Proxy Http Header Client IP Address: " + ipAddress)
+          SessionManager.setProxyHttpHeaderIpAddress(ipAddress)
+      }
 
       val forwarded_for = request.getHeader(X_FORWARDED_FOR_HEADER)
       if (forwarded_for != null) {
@@ -155,6 +160,7 @@ class ThriftHttpServlet(
       // Clear the thread locals
       SessionManager.clearUserName()
       SessionManager.clearIpAddress()
+      SessionManager.clearProxyHttpHeaderIpAddress()
       SessionManager.clearProxyUserName()
       SessionManager.clearForwardedAddresses()
     }

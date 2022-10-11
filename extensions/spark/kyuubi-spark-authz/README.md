@@ -26,7 +26,7 @@
 ## Build
 
 ```shell
-build/mvn clean package -pl :kyuubi-spark-authz_2.12 -Dspark.version=3.2.1 -Dranger.version=2.2.0
+build/mvn clean package -pl :kyuubi-spark-authz_2.12 -Dspark.version=3.2.1 -Dranger.version=2.3.0
 ```
 
 
@@ -39,14 +39,14 @@ build/mvn clean package -pl :kyuubi-spark-authz_2.12 -Dspark.version=3.2.1 -Dran
 - [x] 3.2.x (default)
 - [x] 3.1.x
 - [x] 3.0.x
-- [x] 2.4.x
-- [ ] 2.3.x and earlier
+- [ ] 2.4.x and earlier
 
 ### Supported Apache Ranger Versions
 
 `-Dranger.version=`
 
-- [x] 2.2.x (default)
+- [x] 2.3.x (default)
+- [x] 2.2.x
 - [x] 2.1.x
 - [x] 2.0.x
 - [x] 1.2.x

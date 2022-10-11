@@ -27,12 +27,14 @@ import org.apache.commons.lang3.StringUtils
 import org.apache.hive.service.rpc.thrift.{TExecuteStatementReq, TFetchResultsReq, TOpenSessionReq, TStatusCode}
 
 import org.apache.kyuubi.{KYUUBI_VERSION, Utils}
+import org.apache.kyuubi.config.KyuubiConf
+import org.apache.kyuubi.engine.SemanticVersion
 
 trait SparkQueryTests extends HiveJDBCTestHelper {
 
   protected lazy val SPARK_ENGINE_MAJOR_MINOR_VERSION: (Int, Int) = sparkEngineMajorMinorVersion
 
-  protected lazy val httpMode = false;
+  protected lazy val httpMode = false
 
   test("execute statement - select null") {
     withJdbcStatement() { statement =>
@@ -674,6 +676,20 @@ trait SparkQueryTests extends HiveJDBCTestHelper {
     }
   }
 
+  test("kyuubi #3311: Operation language with an incorrect value") {
+    withSessionConf()(Map(KyuubiConf.OPERATION_LANGUAGE.key -> "SQL"))(Map.empty) {
+      withJdbcStatement() { statement =>
+        statement.executeQuery(s"set ${KyuubiConf.OPERATION_LANGUAGE.key}=AAA")
+        val e = intercept[SQLException](statement.executeQuery("select 1"))
+        assert(e.getMessage.contains("The operation language UNKNOWN doesn't support"))
+        statement.executeQuery(s"set ${KyuubiConf.OPERATION_LANGUAGE.key}=SQL")
+        val result = statement.executeQuery("select 1")
+        assert(result.next())
+        assert(result.getInt(1) === 1)
+      }
+    }
+  }
+
   def sparkEngineMajorMinorVersion: (Int, Int) = {
     var sparkRuntimeVer = ""
     withJdbcStatement() { stmt =>
@@ -682,6 +698,7 @@ trait SparkQueryTests extends HiveJDBCTestHelper {
       sparkRuntimeVer = result.getString(1)
       assert(!result.next())
     }
-    Utils.majorMinorVersion(sparkRuntimeVer)
+    val ver = SemanticVersion(sparkRuntimeVer)
+    (ver.majorVersion, ver.minorVersion)
   }
 }

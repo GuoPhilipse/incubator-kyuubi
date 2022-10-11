@@ -29,14 +29,14 @@ object HighAvailabilityConf {
 
   private def buildConf(key: String): ConfigBuilder = KyuubiConf.buildConf(key)
 
-  @deprecated(s"using ${HA_ADDRESSES.key} instead", "1.6.0")
+  @deprecated("using kyuubi.ha.addresses instead", "1.6.0")
   val HA_ZK_QUORUM: ConfigEntry[String] = buildConf("kyuubi.ha.zookeeper.quorum")
     .doc("(deprecated) The connection string for the zookeeper ensemble")
     .version("1.0.0")
     .stringConf
     .createWithDefault("")
 
-  @deprecated(s"using ${HA_NAMESPACE.key} instead", "1.6.0")
+  @deprecated("using kyuubi.ha.namespace instead", "1.6.0")
   val HA_ZK_NAMESPACE: ConfigEntry[String] = buildConf("kyuubi.ha.zookeeper.namespace")
     .doc("(deprecated) The root directory for the service to deploy its instance uri")
     .version("1.0.0")
@@ -56,13 +56,17 @@ object HighAvailabilityConf {
 
   val HA_CLIENT_CLASS: ConfigEntry[String] =
     buildConf("kyuubi.ha.client.class")
-      .doc("Class name for service discovery client.")
+      .doc("Class name for service discovery client.<ul>" +
+        " <li>Zookeeper: org.apache.kyuubi.ha.client.zookeeper.ZookeeperDiscoveryClient</li>" +
+        " <li>Etcd: org.apache.kyuubi.ha.client.etcd.EtcdDiscoveryClient</li></ul>")
       .version("1.6.0")
       .stringConf
       .checkValue(_.nonEmpty, "must not be empty")
       .createWithDefault("org.apache.kyuubi.ha.client.zookeeper.ZookeeperDiscoveryClient")
 
-  @deprecated(s"using ${HA_ZK_AUTH_TYPE.key} and ${HA_ZK_ENGINE_AUTH_TYPE.key} instead", "1.3.2")
+  @deprecated(
+    "using kyuubi.ha.zookeeper.auth.type and kyuubi.ha.zookeeper.engine.auth.type instead",
+    "1.3.2")
   val HA_ZK_ACL_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.ha.zookeeper.acl.enabled")
       .doc("Set to true if the zookeeper ensemble is kerberized")
@@ -155,7 +159,7 @@ object HighAvailabilityConf {
       .checkValue(_ > 0, "Must be positive")
       .createWithDefault(Duration.ofSeconds(120).toMillis)
 
-  val HA_ZK_ENGINE_REF_ID: OptionalConfigEntry[String] =
+  val HA_ENGINE_REF_ID: OptionalConfigEntry[String] =
     buildConf("kyuubi.ha.engine.ref.id")
       .doc("The engine reference id will be attached to zookeeper node when engine started, " +
         "and the kyuubi server will check it cyclically.")
@@ -178,6 +182,43 @@ object HighAvailabilityConf {
       .doc("The zk node contains the secret that used for internal secure, please make sure " +
         "that it is only visible for Kyuubi.")
       .version("1.5.0")
+      .stringConf
+      .createOptional
+
+  val HA_ETCD_LEASE_TIMEOUT: ConfigEntry[Long] =
+    buildConf("kyuubi.ha.etcd.lease.timeout")
+      .doc("Timeout for etcd keep alive lease. The kyuubi server will known " +
+        "unexpected loss of engine after up to this seconds.")
+      .version("1.6.0")
+      .timeConf
+      .checkValue(_ > 0, "Must be positive")
+      .createWithDefault(Duration.ofSeconds(10).toMillis)
+
+  val HA_ETCD_SSL_ENABLED: ConfigEntry[Boolean] =
+    buildConf("kyuubi.ha.etcd.ssl.enabled")
+      .doc("When set to true, will build a ssl secured etcd client.")
+      .version("1.6.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  val HA_ETCD_SSL_CA_PATH: OptionalConfigEntry[String] =
+    buildConf("kyuubi.ha.etcd.ssl.ca.path")
+      .doc("Where the etcd CA certificate file is stored.")
+      .version("1.6.0")
+      .stringConf
+      .createOptional
+
+  val HA_ETCD_SSL_CLINET_CRT_PATH: OptionalConfigEntry[String] =
+    buildConf("kyuubi.ha.etcd.ssl.client.certificate.path")
+      .doc("Where the etcd SSL certificate file is stored.")
+      .version("1.6.0")
+      .stringConf
+      .createOptional
+
+  val HA_ETCD_SSL_CLINET_KEY_PATH: OptionalConfigEntry[String] =
+    buildConf("kyuubi.ha.etcd.ssl.client.key.path")
+      .doc("Where the etcd SSL key file is stored.")
+      .version("1.6.0")
       .stringConf
       .createOptional
 }

@@ -68,6 +68,34 @@ public class JdbcColumn {
     return type;
   }
 
+  public String getComment() {
+    return comment;
+  }
+
+  public int getOrdinalPos() {
+    return ordinalPos;
+  }
+
+  public Integer getNumPrecRadix() {
+    if (type.equalsIgnoreCase("tinyint")) {
+      return 10;
+    } else if (type.equalsIgnoreCase("smallint")) {
+      return 10;
+    } else if (type.equalsIgnoreCase("int")) {
+      return 10;
+    } else if (type.equalsIgnoreCase("bigint")) {
+      return 10;
+    } else if (type.equalsIgnoreCase("float")) {
+      return 10;
+    } else if (type.equalsIgnoreCase("double")) {
+      return 10;
+    } else if (type.equalsIgnoreCase("decimal")) {
+      return 10;
+    } else { // anything else including boolean and string is null
+      return null;
+    }
+  }
+
   static String columnClassName(TTypeId tType, JdbcColumnAttributes columnAttributes)
       throws SQLException {
     int columnType = convertTTypeIdToSqlType(tType);
@@ -117,7 +145,7 @@ public class JdbcColumn {
       case STRUCT:
         return String.class.getName();
       default:
-        throw new SQLException("Invalid column type: " + columnType);
+        throw new KyuubiSQLException("Invalid column type: " + columnType);
     }
   }
 
@@ -164,7 +192,7 @@ public class JdbcColumn {
       case NULL_TYPE:
         return NULL;
       default:
-        throw new SQLException("Invalid column type: " + type);
+        throw new KyuubiSQLException("Invalid column type: " + type);
     }
   }
 
@@ -213,7 +241,7 @@ public class JdbcColumn {
       case NULL_TYPE:
         return "void";
       default:
-        throw new SQLException("Invalid column type: " + type);
+        throw new KyuubiSQLException("Invalid column type: " + type);
     }
   }
 
@@ -258,7 +286,7 @@ public class JdbcColumn {
       case STRUCT:
         return Integer.MAX_VALUE;
       default:
-        throw new SQLException("Invalid column type: " + columnType);
+        throw new KyuubiSQLException("Invalid column type: " + columnType);
     }
   }
 
@@ -317,7 +345,7 @@ public class JdbcColumn {
       case STRUCT:
         return Integer.MAX_VALUE;
       default:
-        throw new SQLException("Invalid column type: " + columnType);
+        throw new KyuubiSQLException("Invalid column type: " + columnType);
     }
   }
 
@@ -350,35 +378,7 @@ public class JdbcColumn {
       case STRUCT:
         return 0;
       default:
-        throw new SQLException("Invalid column type: " + columnType);
+        throw new KyuubiSQLException("Invalid column type: " + columnType);
     }
-  }
-
-  public Integer getNumPrecRadix() {
-    if (type.equalsIgnoreCase("tinyint")) {
-      return 10;
-    } else if (type.equalsIgnoreCase("smallint")) {
-      return 10;
-    } else if (type.equalsIgnoreCase("int")) {
-      return 10;
-    } else if (type.equalsIgnoreCase("bigint")) {
-      return 10;
-    } else if (type.equalsIgnoreCase("float")) {
-      return 10;
-    } else if (type.equalsIgnoreCase("double")) {
-      return 10;
-    } else if (type.equalsIgnoreCase("decimal")) {
-      return 10;
-    } else { // anything else including boolean and string is null
-      return null;
-    }
-  }
-
-  public String getComment() {
-    return comment;
-  }
-
-  public int getOrdinalPos() {
-    return ordinalPos;
   }
 }

@@ -27,14 +27,10 @@ import java.util.regex.Pattern;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.ExponentialBackoffRetry;
-import org.apache.kyuubi.jdbc.hive.Utils.JdbcConnectionParams;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 class ZooKeeperHiveClientHelper {
-  static final Logger LOG = LoggerFactory.getLogger(ZooKeeperHiveClientHelper.class.getName());
   // Pattern for key1=value1;key2=value2
-  private static final Pattern kvPattern = Pattern.compile("([^=;]*)=([^;]*)[;]?");
+  private static final Pattern kvPattern = Pattern.compile("([^=;]*)=([^;]*);?");
 
   private static String getZooKeeperNamespace(JdbcConnectionParams connParams) {
     String zooKeeperNamespace =
@@ -109,9 +105,7 @@ class ZooKeeperHiveClientHelper {
 
   static void configureConnParams(JdbcConnectionParams connParams)
       throws ZooKeeperHiveClientException {
-    CuratorFramework zooKeeperClient = null;
-    try {
-      zooKeeperClient = getZkClient(connParams);
+    try (CuratorFramework zooKeeperClient = getZkClient(connParams)) {
       List<String> serverHosts = getServerHosts(connParams, zooKeeperClient);
       // Now pick a server node randomly
       String serverNode = serverHosts.get(new Random().nextInt(serverHosts.size()));
@@ -119,19 +113,13 @@ class ZooKeeperHiveClientHelper {
     } catch (Exception e) {
       throw new ZooKeeperHiveClientException(
           "Unable to read HiveServer2 configs from ZooKeeper", e);
-    } finally {
-      // Close the client connection with ZooKeeper
-      if (zooKeeperClient != null) {
-        zooKeeperClient.close();
-      }
     }
+    // Close the client connection with ZooKeeper
   }
 
   static List<JdbcConnectionParams> getDirectParamsList(JdbcConnectionParams connParams)
       throws ZooKeeperHiveClientException {
-    CuratorFramework zooKeeperClient = null;
-    try {
-      zooKeeperClient = getZkClient(connParams);
+    try (CuratorFramework zooKeeperClient = getZkClient(connParams)) {
       List<String> serverHosts = getServerHosts(connParams, zooKeeperClient);
       final List<JdbcConnectionParams> directParamsList = new ArrayList<>();
       // For each node
@@ -144,23 +132,15 @@ class ZooKeeperHiveClientHelper {
     } catch (Exception e) {
       throw new ZooKeeperHiveClientException(
           "Unable to read HiveServer2 configs from ZooKeeper", e);
-    } finally {
-      // Close the client connection with ZooKeeper
-      if (zooKeeperClient != null) {
-        zooKeeperClient.close();
-      }
     }
+    // Close the client connection with ZooKeeper
   }
 
   /**
    * Apply configs published by the server. Configs specified from client's JDBC URI override
    * configs published by the server.
-   *
-   * @param serverConfStr
-   * @param connParams
-   * @throws Exception
    */
-  private static void applyConfs(String serverConfStr, Utils.JdbcConnectionParams connParams)
+  private static void applyConfs(String serverConfStr, JdbcConnectionParams connParams)
       throws Exception {
     Matcher matcher = kvPattern.matcher(serverConfStr);
     while (matcher.find()) {
@@ -176,12 +156,8 @@ class ZooKeeperHiveClientHelper {
         }
         // Set transportMode
         if ((matcher.group(1).equals("hive.server2.transport.mode"))
-            && !(connParams
-                .getSessionVars()
-                .containsKey(Utils.JdbcConnectionParams.TRANSPORT_MODE))) {
-          connParams
-              .getSessionVars()
-              .put(Utils.JdbcConnectionParams.TRANSPORT_MODE, matcher.group(2));
+            && !(connParams.getSessionVars().containsKey(JdbcConnectionParams.TRANSPORT_MODE))) {
+          connParams.getSessionVars().put(JdbcConnectionParams.TRANSPORT_MODE, matcher.group(2));
         }
         // Set port
         if (matcher.group(1).equals("hive.server2.thrift.port")) {
@@ -193,57 +169,45 @@ class ZooKeeperHiveClientHelper {
         }
         // Set sasl qop
         if ((matcher.group(1).equals("hive.server2.thrift.sasl.qop"))
-            && !(connParams.getSessionVars().containsKey(Utils.JdbcConnectionParams.AUTH_QOP))) {
-          connParams.getSessionVars().put(Utils.JdbcConnectionParams.AUTH_QOP, matcher.group(2));
+            && !(connParams.getSessionVars().containsKey(JdbcConnectionParams.AUTH_QOP))) {
+          connParams.getSessionVars().put(JdbcConnectionParams.AUTH_QOP, matcher.group(2));
         }
         // Set http path
         if ((matcher.group(1).equals("hive.server2.thrift.http.path"))
-            && !(connParams.getSessionVars().containsKey(Utils.JdbcConnectionParams.HTTP_PATH))) {
-          connParams.getSessionVars().put(Utils.JdbcConnectionParams.HTTP_PATH, matcher.group(2));
+            && !(connParams.getSessionVars().containsKey(JdbcConnectionParams.HTTP_PATH))) {
+          connParams.getSessionVars().put(JdbcConnectionParams.HTTP_PATH, matcher.group(2));
         }
         // Set SSL
         if ((matcher.group(1) != null)
             && (matcher.group(1).equals("hive.server2.use.SSL"))
-            && !(connParams.getSessionVars().containsKey(Utils.JdbcConnectionParams.USE_SSL))) {
-          connParams.getSessionVars().put(Utils.JdbcConnectionParams.USE_SSL, matcher.group(2));
+            && !(connParams.getSessionVars().containsKey(JdbcConnectionParams.USE_SSL))) {
+          connParams.getSessionVars().put(JdbcConnectionParams.USE_SSL, matcher.group(2));
         }
-        /**
+        /*
          * Note: this is pretty messy, but sticking to the current implementation. Set
          * authentication configs. Note that in JDBC driver, we have 3 auth modes: NOSASL, Kerberos
-         * (including delegation token mechanism) and password based. The use of
+         * and password based. The use of
          * JdbcConnectionParams.AUTH_TYPE==JdbcConnectionParams.AUTH_SIMPLE picks NOSASL. The
-         * presence of JdbcConnectionParams.AUTH_PRINCIPAL==<principal> picks Kerberos. If principal
-         * is absent, the presence of
-         * JdbcConnectionParams.AUTH_TYPE==JdbcConnectionParams.AUTH_TOKEN uses delegation token.
+         * presence of JdbcConnectionParams.AUTH_PRINCIPAL==<principal> picks Kerberos.
          * Otherwise password based (which includes NONE, PAM, LDAP, CUSTOM)
          */
         if (matcher.group(1).equals("hive.server2.authentication")) {
           // NOSASL
           if (matcher.group(2).equalsIgnoreCase("NOSASL")
-              && !(connParams.getSessionVars().containsKey(Utils.JdbcConnectionParams.AUTH_TYPE)
+              && !(connParams.getSessionVars().containsKey(JdbcConnectionParams.AUTH_TYPE)
                   && connParams
                       .getSessionVars()
-                      .get(Utils.JdbcConnectionParams.AUTH_TYPE)
-                      .equalsIgnoreCase(Utils.JdbcConnectionParams.AUTH_SIMPLE))) {
+                      .get(JdbcConnectionParams.AUTH_TYPE)
+                      .equalsIgnoreCase(JdbcConnectionParams.AUTH_SIMPLE))) {
             connParams
                 .getSessionVars()
-                .put(Utils.JdbcConnectionParams.AUTH_TYPE, Utils.JdbcConnectionParams.AUTH_SIMPLE);
+                .put(JdbcConnectionParams.AUTH_TYPE, JdbcConnectionParams.AUTH_SIMPLE);
           }
         }
         // KERBEROS
-        // If delegation token is passed from the client side, do not set the principal
         if (matcher.group(1).equalsIgnoreCase("hive.server2.authentication.kerberos.principal")
-            && !(connParams.getSessionVars().containsKey(Utils.JdbcConnectionParams.AUTH_TYPE)
-                && connParams
-                    .getSessionVars()
-                    .get(Utils.JdbcConnectionParams.AUTH_TYPE)
-                    .equalsIgnoreCase(Utils.JdbcConnectionParams.AUTH_TOKEN))
-            && !(connParams
-                .getSessionVars()
-                .containsKey(Utils.JdbcConnectionParams.AUTH_PRINCIPAL))) {
-          connParams
-              .getSessionVars()
-              .put(Utils.JdbcConnectionParams.AUTH_PRINCIPAL, matcher.group(2));
+            && !(connParams.getSessionVars().containsKey(JdbcConnectionParams.AUTH_PRINCIPAL))) {
+          connParams.getSessionVars().put(JdbcConnectionParams.AUTH_PRINCIPAL, matcher.group(2));
         }
       }
     }

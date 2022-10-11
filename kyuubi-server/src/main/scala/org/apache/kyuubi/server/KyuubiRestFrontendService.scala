@@ -79,10 +79,13 @@ class KyuubiRestFrontendService(override val serverable: Serverable)
     val authenticationFactory = new KyuubiHttpAuthenticationFactory(conf)
     server.addHandler(authenticationFactory.httpHandlerWrapperFactory.wrapHandler(contextHandler))
 
-    server.addStaticHandler("org/apache/kyuubi/ui/static", "/static")
-    server.addRedirectHandler("/", "/static")
-    server.addStaticHandler("org/apache/kyuubi/ui/swagger", "/swagger")
-    server.addRedirectHandler("/docs", "/swagger")
+    server.addStaticHandler("org/apache/kyuubi/ui/static", "/static/")
+    server.addRedirectHandler("/", "/static/")
+    server.addRedirectHandler("/static", "/static/")
+    server.addStaticHandler("org/apache/kyuubi/ui/swagger", "/swagger/")
+    server.addRedirectHandler("/docs", "/swagger/")
+    server.addRedirectHandler("/docs/", "/swagger/")
+    server.addRedirectHandler("/swagger", "/swagger/")
   }
 
   private def startBatchChecker(): Unit = {
@@ -170,9 +173,16 @@ class KyuubiRestFrontendService(override val serverable: Serverable)
   }
 
   def getUserName(sessionConf: Map[String, String]): String = {
+    // using the remote ip address instead of that in proxy http header for authentication
+    val ipAddress = AuthenticationFilter.getUserIpAddress
     val realUser: String = ServiceUtils.getShortName(
       Option(AuthenticationFilter.getUserName).filter(_.nonEmpty).getOrElse("anonymous"))
-    getProxyUser(sessionConf, Option(AuthenticationFilter.getUserIpAddress).orNull, realUser)
+    getProxyUser(sessionConf, ipAddress, realUser)
+  }
+
+  def getIpAddress: String = {
+    Option(AuthenticationFilter.getUserProxyHeaderIpAddress).getOrElse(
+      AuthenticationFilter.getUserIpAddress)
   }
 
   private def getProxyUser(

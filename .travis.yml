@@ -26,11 +26,7 @@ branches:
   only:
     - master
 
-language: scala
-scala:
-  - 2.12.15
-jdk:
-  - openjdk8
+language: java
 
 matrix:
   include:
@@ -56,10 +52,13 @@ cache:
     - $HOME/.m2
 
 install:
+  - sudo apt update
+  - sudo apt install -y openjdk-8-jdk
+  - export JAVA_HOME="/usr/lib/jvm/java-8-openjdk-${TRAVIS_CPU_ARCH}"
+  - export PATH="$JAVA_HOME/bin:/usr/share/maven/bin:$PATH"
   - ./build/mvn --version
 
 before_script:
-  - export JAVA_HOME="$(realpath -Pm "$(which javac)/../../")"
   - export MVN_ARGS="-Dmaven.javadoc.skip=true -Drat.skip=true -Dscalastyle.skip=true -Dspotless.check.skip -V -B -ntp -Dorg.slf4j.simpleLogger.defaultLogLevel=warn"
   - ./build/mvn clean install -DskipTests $MVN_ARGS
 

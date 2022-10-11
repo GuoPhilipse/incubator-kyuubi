@@ -18,41 +18,69 @@
 package org.apache.kyuubi.plugin.spark.authz.ranger
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.catalog.CatalogTable
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.connector.catalog.Identifier
 
-import org.apache.kyuubi.plugin.spark.authz.{ObjectType, OperationType}
+import org.apache.kyuubi.plugin.spark.authz.{IcebergCommands, ObjectType, OperationType}
+import org.apache.kyuubi.plugin.spark.authz.util.{PermanentViewMarker, RowFilterAndDataMaskingMarker}
 import org.apache.kyuubi.plugin.spark.authz.util.AuthZUtils._
-import org.apache.kyuubi.plugin.spark.authz.util.RowFilterAndDataMaskingMarker
 
 class RuleApplyRowFilterAndDataMasking(spark: SparkSession) extends Rule[LogicalPlan] {
 
+  private def mapPlanChildren(plan: LogicalPlan)(f: LogicalPlan => LogicalPlan): LogicalPlan = {
+    val newChildren = plan match {
+      case _ if IcebergCommands.accept(plan.nodeName) =>
+        val skipped = IcebergCommands.skipMappedChildren(plan)
+        skipped ++ (plan.children diff skipped).map(f)
+      case _ =>
+        plan.children.map(f)
+    }
+    plan.withNewChildren(newChildren)
+  }
+
   override def apply(plan: LogicalPlan): LogicalPlan = {
-    // Apply FilterAndMasking and wrap HiveTableRelation/LogicalRelation with
+    // Apply FilterAndMasking and wrap HiveTableRelation/LogicalRelation/DataSourceV2Relation with
     // RowFilterAndDataMaskingMarker if it is not wrapped yet.
-    plan mapChildren {
+    mapPlanChildren(plan) {
       case p: RowFilterAndDataMaskingMarker => p
       case hiveTableRelation if hasResolvedHiveTable(hiveTableRelation) =>
         val table = getHiveTable(hiveTableRelation)
-        applyFilterAndMasking(hiveTableRelation, table, spark)
+        applyFilterAndMasking(hiveTableRelation, table.identifier, spark)
       case logicalRelation if hasResolvedDatasourceTable(logicalRelation) =>
         val table = getDatasourceTable(logicalRelation)
         if (table.isEmpty) {
           logicalRelation
         } else {
-          applyFilterAndMasking(logicalRelation, table.get, spark)
+          applyFilterAndMasking(logicalRelation, table.get.identifier, spark)
         }
+      case datasourceV2Relation if hasResolvedDatasourceV2Table(datasourceV2Relation) =>
+        val tableIdentifier = getDatasourceV2Identifier(datasourceV2Relation)
+        if (tableIdentifier.isEmpty) {
+          datasourceV2Relation
+        } else {
+          applyFilterAndMasking(datasourceV2Relation, tableIdentifier.get, spark)
+        }
+      case permanentView: PermanentViewMarker =>
+        val viewIdent = permanentView.catalogTable.identifier
+        applyFilterAndMasking(permanentView, viewIdent, spark)
       case other => apply(other)
     }
   }
 
   private def applyFilterAndMasking(
       plan: LogicalPlan,
-      table: CatalogTable,
+      identifier: Identifier,
       spark: SparkSession): LogicalPlan = {
-    val identifier = table.identifier
+    applyFilterAndMasking(plan, getTableIdentifierFromV2Identifier(identifier), spark)
+  }
+
+  private def applyFilterAndMasking(
+      plan: LogicalPlan,
+      identifier: TableIdentifier,
+      spark: SparkSession): LogicalPlan = {
     val ugi = getAuthzUgi(spark.sparkContext)
     val opType = OperationType(plan.nodeName)
     val parse = spark.sessionState.sqlParser.parseExpression _
@@ -68,7 +96,12 @@ class RuleApplyRowFilterAndDataMasking(spark: SparkSession) extends Rule[Logical
         attr
       } else {
         val maskExpr = parse(maskExprStr.get)
-        Alias(maskExpr, attr.name)()
+        plan match {
+          case _: PermanentViewMarker =>
+            Alias(maskExpr, attr.name)(exprId = attr.exprId)
+          case _ =>
+            Alias(maskExpr, attr.name)()
+        }
       }
     }
 

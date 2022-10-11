@@ -17,13 +17,14 @@
 
 package org.apache.kyuubi
 
-import java.io.{File, InputStreamReader, IOException, PrintWriter, StringWriter}
+import java.io._
 import java.net.{Inet4Address, InetAddress, NetworkInterface}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
 import java.util.{Properties, TimeZone, UUID}
 
 import scala.collection.JavaConverters._
+import scala.sys.process._
 import scala.util.control.NonFatal
 import scala.util.matching.Regex
 
@@ -54,7 +55,7 @@ object Utils extends Logging {
       .map(d => new File(d + File.separator + KYUUBI_CONF_FILE_NAME))
       .filter(_.exists())
       .orElse {
-        Option(getClass.getClassLoader.getResource(KYUUBI_CONF_FILE_NAME)).map { url =>
+        Option(Utils.getContextOrKyuubiClassLoader.getResource(KYUUBI_CONF_FILE_NAME)).map { url =>
           new File(url.getFile)
         }.filter(_.exists())
       }
@@ -144,20 +145,7 @@ object Utils extends Logging {
 
   def currentUser: String = UserGroupInformation.getCurrentUser.getShortUserName
 
-  private val majorMinorRegex = """^(\d+)\.(\d+)(\..*)?$""".r
   private val shortVersionRegex = """^(\d+\.\d+\.\d+)(.*)?$""".r
-
-  /**
-   * Given a Kyuubi/Spark/Hive version string, return the major version number.
-   * E.g., for 2.0.1-SNAPSHOT, return 2.
-   */
-  def majorVersion(version: String): Int = majorMinorVersion(version)._1
-
-  /**
-   * Given a Kyuubi/Spark/Hive version string, return the minor version number.
-   * E.g., for 2.0.1-SNAPSHOT, return 0.
-   */
-  def minorVersion(version: String): Int = majorMinorVersion(version)._2
 
   /**
    * Given a Kyuubi/Spark/Hive version string, return the short version string.
@@ -169,21 +157,6 @@ object Utils extends Logging {
       case None =>
         throw new IllegalArgumentException(s"Tried to parse '$version' as a project" +
           s" version string, but it could not find the major/minor/maintenance version numbers.")
-    }
-  }
-
-  /**
-   * Given a Kyuubi/Spark/Hive version string,
-   * return the (major version number, minor version number).
-   * E.g., for 2.0.1-SNAPSHOT, return (2, 0).
-   */
-  def majorMinorVersion(version: String): (Int, Int) = {
-    majorMinorRegex.findFirstMatchIn(version) match {
-      case Some(m) =>
-        (m.group(1).toInt, m.group(2).toInt)
-      case None =>
-        throw new IllegalArgumentException(s"Tried to parse '$version' as a project" +
-          s" version string, but it could not find the major and minor version numbers.")
     }
   }
 
@@ -339,4 +312,23 @@ object Utils extends Logging {
         (key, value)
     }.asInstanceOf[Seq[(K, V)]]
   }
+
+  def isCommandAvailable(cmd: String): Boolean = s"which $cmd".! == 0
+
+  /**
+   * Get the ClassLoader which loaded Kyuubi.
+   */
+  def getKyuubiClassLoader: ClassLoader = getClass.getClassLoader
+
+  /**
+   * Get the Context ClassLoader on this thread or, if not present, the ClassLoader that
+   * loaded Kyuubi.
+   *
+   * This should be used whenever passing a ClassLoader to Class.ForName or finding the currently
+   * active loader when setting up ClassLoader delegation chains.
+   */
+  def getContextOrKyuubiClassLoader: ClassLoader =
+    Option(Thread.currentThread().getContextClassLoader).getOrElse(getKyuubiClassLoader)
+
+  def isOnK8s: Boolean = Files.exists(Paths.get("/var/run/secrets/kubernetes.io"))
 }

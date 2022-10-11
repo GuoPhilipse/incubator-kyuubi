@@ -22,7 +22,7 @@
     <parent>
         <groupId>org.apache.kyuubi</groupId>
         <artifactId>kyuubi-parent</artifactId>
-        <version>1.6.0-SNAPSHOT</version>
+        <version>1.7.0-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -49,6 +49,16 @@
             <groupId>org.apache.kyuubi</groupId>
             <artifactId>kyuubi-ha_${scala.binary.version}</artifactId>
             <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-core</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-protobuf</artifactId>
         </dependency>
 
         <dependency>
@@ -126,14 +136,8 @@
         </dependency>
 
         <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>jul-to-slf4j</artifactId>
-            <scope>test</scope>
-        </dependency>
-
-        <dependency>
             <groupId>org.apache.iceberg</groupId>
-            <artifactId>${iceberg.name}</artifactId>
+            <artifactId>iceberg-spark-runtime-${spark.binary.version}_${scala.binary.version}</artifactId>
             <scope>test</scope>
         </dependency>
 
@@ -185,6 +189,12 @@
             <version>${project.version}</version>
             <scope>test</scope>
         </dependency>
+
+        <dependency>
+            <groupId>io.etcd</groupId>
+            <artifactId>jetcd-launcher</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -198,12 +208,21 @@
                     <shadedArtifactAttached>false</shadedArtifactAttached>
                     <artifactSet>
                         <includes>
+                            <include>com.google.guava:*</include>
+                            <include>com.google.protobuf:*</include>
+                            <include>io.etcd:*</include>
+                            <include>io.grpc:*</include>
+                            <include>io.netty:*</include>
+                            <include>io.perfmark:perfmark-api</include>
+                            <include>io.vertx:*</include>
+                            <include>net.jodah:failsafe</include>
                             <include>org.apache.kyuubi:kyuubi-common_${scala.binary.version}</include>
                             <include>org.apache.kyuubi:kyuubi-events_${scala.binary.version}</include>
                             <include>org.apache.kyuubi:kyuubi-ha_${scala.binary.version}</include>
                             <include>org.apache.curator:curator-client</include>
                             <include>org.apache.curator:curator-framework</include>
                             <include>org.apache.curator:curator-recipes</include>
+                            <include>org.apache.zookeeper:zookeeper</include>
                             <include>org.apache.hive:hive-service-rpc</include>
                             <include>org.apache.thrift:*</include>
                         </includes>
@@ -235,6 +254,20 @@
                             </includes>
                         </relocation>
                         <relocation>
+                            <pattern>org.apache.zookeeper</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.org.apache.zookeeper</shadedPattern>
+                            <includes>
+                                <include>org.apache.zookeeper.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
+                            <pattern>org.apache.jute</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.org.apache.jute</shadedPattern>
+                            <includes>
+                                <include>org.apache.jute.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
                             <pattern>org.apache.hive.service.rpc.thrift</pattern>
                             <shadedPattern>${kyuubi.shade.packageName}.org.apache.hive.service.rpc.thrift</shadedPattern>
                             <includes>
@@ -253,6 +286,41 @@
                             <shadedPattern>${kyuubi.shade.packageName}.org.apache.thrift</shadedPattern>
                             <includes>
                                 <include>org.apache.thrift.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
+                            <pattern>com.google</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.com.google</shadedPattern>
+                            <includes>
+                                <include>com.google.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
+                            <pattern>io.netty</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.io.netty</shadedPattern>
+                            <includes>
+                                <include>io.netty.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
+                            <pattern>io.vertx</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.io.vertx</shadedPattern>
+                            <includes>
+                                <include>io.vertx.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
+                            <pattern>net.jodah</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.net.jodah</shadedPattern>
+                            <includes>
+                                <include>net.jodah.**</include>
+                            </includes>
+                        </relocation>
+                        <relocation>
+                            <pattern>io.perfmark</pattern>
+                            <shadedPattern>${kyuubi.shade.packageName}.io.perfmark</shadedPattern>
+                            <includes>
+                                <include>io.perfmark.**</include>
                             </includes>
                         </relocation>
                     </relocations>
